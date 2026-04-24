@@ -16,8 +16,10 @@ matplotlib.use("Agg")
 
 warnings.filterwarnings("ignore")
 
+import numpy as np
+
 from config import SEED, N_TRAIN_SERIES, N_TEST_SERIES, N_TRAIN_DAYS, N_TEST_DAYS, OUTPUT_DIR
-from data import prepare_datasets
+from data import prepare_datasets, prepare_test_data
 from model import KDAPolicyNetwork
 from train import train_grpo
 from evaluate import (
@@ -84,15 +86,13 @@ def main():
         print(f"Device: {device}  |  World size: {world_size}")
         os.makedirs(OUTPUT_DIR, exist_ok=True)
 
-    # ──── Step 1: Data ────
-    data = prepare_datasets(device)
+    # ──── Step 1: Train data only (all ranks) ────
+    seed_rng = np.random.RandomState(SEED)
+    rank_seeds = [seed_rng.randint(0, 2**31) for _ in range(world_size)]
+    data = prepare_datasets(device, seed=rank_seeds[rank])
 
     if is_main:
-        print(f"Generated {N_TRAIN_SERIES} train series × {N_TRAIN_DAYS} days  +  "
-              f"{N_TEST_SERIES} test series × {N_TEST_DAYS} days")
-        print(f"Train: {sum(f.shape[0] for f in data['train_feats'])} samples  "
-              f"Test: {sum(f.shape[0] for f in data['test_feats'])} samples")
-        plot_prices([data["prices_list"][i] for i in TEST_IDS], output_dir=OUTPUT_DIR)
+        print(f"Train: {sum(f.shape[0] for f in data['train_feats'])} samples")
 
     # all ranks must wait for rank 0 to finish plotting before entering DDP
     if world_size > 1:
@@ -112,15 +112,16 @@ def main():
     if world_size > 1:
         dist.barrier()
 
-    # ──── Step 4: Evaluate + Export ────
+    # ──── Step 4: Test data + Evaluate (rank 0 only) ────
     if is_main:
         raw_policy.eval()
-
-        # Save model weights
         save_model(raw_policy, os.path.join(OUTPUT_DIR, "policy.pt"))
 
-        # Backtest
-        results = run_backtest(raw_policy, data["test_feats"], data["test_rets"])
+        # generate test data now — only rank 0
+        test_data = prepare_test_data(device, data["scaler"], data["feat_cols"])
+        plot_prices(test_data["prices_list"], output_dir=OUTPUT_DIR)
+
+        results = run_backtest(raw_policy, test_data["test_feats"], test_data["test_rets"])
         plot_results(results, output_dir=OUTPUT_DIR)
 
         # Export CSV + JSON

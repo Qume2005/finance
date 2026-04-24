@@ -199,108 +199,111 @@ def compute_mmn_features(close, series_id):
     ]).drop_nulls()
 
 
-def prepare_datasets(device):
-    """
-    Generate synthetic data, compute features, split, scale.
-    - 每条序列随机分配市场类型（主板/创业板/科创板）
-    - 训练序列生成 N_TRAIN_DAYS 天，测试序列生成 N_TEST_DAYS 天
-    Returns dict with GPU tensors ready for training.
-    """
-    np.random.seed(SEED)
-    torch.manual_seed(SEED)
-
-    param_rng = np.random.RandomState(SEED)
-    market_type_list   = []
-    annual_return_list = []
-    n_days_list        = []
-
-    mt_choices = ["main", "chinext", "star"]
-    mt_weights = [0.60, 0.25, 0.15]
-
-    for i in range(N_SERIES):
+def _generate_series_block(n_series, n_days, param_rng, seed, device,
+                           mt_choices, mt_weights):
+    """Generate, compute features, and return (prices_list, feat_df, params_info)."""
+    market_types, annual_returns, n_days_list = [], [], []
+    for i in range(n_series):
         mt = param_rng.choice(mt_choices, p=mt_weights)
         ar = param_rng.uniform(-0.05, 0.25)
-        nd = N_TRAIN_DAYS if i in TRAIN_IDS else N_TEST_DAYS
-        market_type_list.append(mt)
-        annual_return_list.append(ar)
-        n_days_list.append(nd)
-        print(f"\r  [{i+1}/{N_SERIES}] Series {i} ({'train' if i in TRAIN_IDS else 'test':>5}): "
-              f"days={nd}  market={mt:<7}  return={ar:+.1%}", end="", flush=True)
-    print()
+        market_types.append(mt)
+        annual_returns.append(ar)
+        n_days_list.append(n_days)
 
-    # batch generate all series on GPU
-    print(f"  Generating {N_SERIES} series on GPU...")
     prices_arrays = generate_price_series_batch(
-        n_days_list, market_type_list, annual_return_list,
-        seed=SEED, device=device)
-    print(f"  Done.")
+        n_days_list, market_types, annual_returns,
+        seed=seed, device=device)
 
-    # build DataFrames (keep pandas for bdate_range)
-    print(f"  Building DataFrames...")
     prices_list = [
         pl.DataFrame({
             "date":   pd.bdate_range("2016-01-01", periods=len(prices_arrays[i])).to_numpy(),
             "close":  prices_arrays[i],
-            "series_id": i,
         })
-        for i in range(N_SERIES)]
+        for i in range(n_series)]
 
-    print(f"  Computing features ({N_SERIES} series)...")
-    feat_list = []
-    for i in range(N_SERIES):
-        feat_list.append(compute_mmn_features(prices_arrays[i], i))
-        if (i + 1) % 500 == 0 or i == N_SERIES - 1:
-            print(f"\r  Features: {i+1}/{N_SERIES}", end="", flush=True)
-    print()
+    feat_list = [compute_mmn_features(prices_arrays[i], i) for i in range(n_series)]
+    return prices_list, pl.concat(feat_list, how="vertical"), market_types, annual_returns
 
-    df_feat = pl.concat(feat_list, how="vertical")
+
+def _df_to_tensors(df, feat_cols, scaler, series_ids, device):
+    """Sort by series_id, batch-transform, split into per-series GPU tensors."""
+    sorted_df = df.sort("series_id")
+    X = scaler.transform(sorted_df.select(feat_cols).to_numpy())
+    rets = sorted_df["daily_return"].to_numpy()
+    sids = sorted_df["series_id"].to_numpy()
+
+    unique_sids, starts = np.unique(sids, return_index=True)
+    sid_map = {s: i for i, s in enumerate(unique_sids)}
+    ends = np.concatenate([starts[1:], [len(sids)]])
+
+    feats_out, rets_out = [], []
+    for sid in series_ids:
+        j = sid_map[sid]
+        feats_out.append(torch.FloatTensor(X[starts[j]:ends[j]]).to(device))
+        rets_out.append(torch.FloatTensor(rets[starts[j]:ends[j]]).to(device))
+    return feats_out, rets_out
+
+
+def prepare_datasets(device, seed=None):
+    """
+    Generate training data only.
+    Returns dict with scaler, feat_cols, and per-series GPU tensors.
+    """
+    seed = seed if seed is not None else SEED
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+
+    param_rng = np.random.RandomState(seed)
+    mt_choices = ["main", "chinext", "star"]
+    mt_weights = [0.60, 0.25, 0.15]
+
+    print(f"  Generating {N_TRAIN_SERIES} train series (GPU, seed={seed})...")
+    prices_list, df_feat, mt_list, ar_list = _generate_series_block(
+        N_TRAIN_SERIES, N_TRAIN_DAYS, param_rng, seed, device,
+        mt_choices, mt_weights)
+    print(f"  Done. {len(df_feat)} samples.")
+
     feat_cols = [f"d_mm_min_{w}" for w in WINDOWS] + [f"d_mm_max_{w}" for w in WINDOWS]
-
     print(f"  Fitting scaler...")
-    train_df = df_feat.filter(pl.col("series_id").is_in(TRAIN_IDS))
-    test_df  = df_feat.filter(pl.col("series_id").is_in(TEST_IDS))
-
     scaler = StandardScaler()
-    scaler.fit(train_df.select(feat_cols).to_numpy())
+    scaler.fit(df_feat.select(feat_cols).to_numpy())
 
     print(f"  Uploading to GPU...")
-    # sort + batch transform + numpy slice (avoids per-series filter)
-    train_sorted = train_df.sort("series_id")
-    train_X = scaler.transform(train_sorted.select(feat_cols).to_numpy())
-    train_rets_all = train_sorted["daily_return"].to_numpy()
-    train_sids = train_sorted["series_id"].to_numpy()
-
-    unique_sids, starts = np.unique(train_sids, return_index=True)
-    sid_to_idx = {s: i for i, s in enumerate(unique_sids)}
-    ends = np.concatenate([starts[1:], [len(train_sids)]])
-
-    train_feats, train_rets = [], []
-    for sid in TRAIN_IDS:
-        j = sid_to_idx[sid]
-        train_feats.append(torch.FloatTensor(train_X[starts[j]:ends[j]]).to(device))
-        train_rets.append(torch.FloatTensor(train_rets_all[starts[j]:ends[j]]).to(device))
-
-    test_sorted = test_df.sort("series_id")
-    test_X = scaler.transform(test_sorted.select(feat_cols).to_numpy())
-    test_rets_all = test_sorted["daily_return"].to_numpy()
-    test_sids = test_sorted["series_id"].to_numpy()
-
-    unique_tsids, tstarts = np.unique(test_sids, return_index=True)
-    tsid_to_idx = {s: i for i, s in enumerate(unique_tsids)}
-    tends = np.concatenate([tstarts[1:], [len(test_sids)]])
-
-    test_feats, test_rets = [], []
-    for sid in TEST_IDS:
-        j = tsid_to_idx[sid]
-        test_feats.append(torch.FloatTensor(test_X[tstarts[j]:tends[j]]).to(device))
-        test_rets.append(torch.FloatTensor(test_rets_all[tstarts[j]:tends[j]]).to(device))
+    train_ids = list(range(N_TRAIN_SERIES))
+    train_feats, train_rets = _df_to_tensors(
+        df_feat, feat_cols, scaler, train_ids, device)
 
     return {
-        "prices_list":  prices_list,
         "feat_cols":    feat_cols,
         "scaler":       scaler,
         "train_feats":  train_feats,
         "train_rets":   train_rets,
+    }
+
+
+def prepare_test_data(device, scaler, feat_cols):
+    """
+    Generate test data using a pre-fitted scaler (rank 0 only).
+    Returns dict with prices_list and per-series GPU tensors.
+    """
+    np.random.seed(SEED)
+    torch.manual_seed(SEED)
+    param_rng = np.random.RandomState(SEED)
+    mt_choices = ["main", "chinext", "star"]
+    mt_weights = [0.60, 0.25, 0.15]
+
+    print(f"  Generating {N_TEST_SERIES} test series (GPU)...")
+    prices_list, df_feat, _, _ = _generate_series_block(
+        N_TEST_SERIES, N_TEST_DAYS, param_rng, SEED, device,
+        mt_choices, mt_weights)
+    print(f"  Done. {len(df_feat)} samples.")
+
+    test_ids = list(range(N_TEST_SERIES))
+    test_feats, test_rets = _df_to_tensors(
+        df_feat, feat_cols, scaler, test_ids, device)
+
+    return {
+        "prices_list":  prices_list,
         "test_feats":   test_feats,
         "test_rets":    test_rets,
     }
