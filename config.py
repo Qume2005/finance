@@ -24,7 +24,7 @@ LAMBDA_DD   = 2.0
 EPS_CLIP    = 0.2
 BETA_KL     = 0.04
 N_EPISODES  = 2000
-LR          = 5e-3
+LR          = 1e-3
 
 # Output
 OUTPUT_DIR = "output"
