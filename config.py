@@ -25,6 +25,7 @@ EPS_CLIP    = 0.2
 BETA_KL     = 0.04
 N_EPISODES  = 5000
 LR          = 1e-3
+BATCH_SIZE  = 256       # episodes per GRPO step (32GB 显卡甜点，按需调整)
 
 # Output
 OUTPUT_DIR = "output"

@@ -19,7 +19,8 @@ warnings.filterwarnings("ignore")
 
 import numpy as np
 
-from config import SEED, N_TRAIN_SERIES, N_TEST_SERIES, N_TRAIN_DAYS, N_TEST_DAYS, OUTPUT_DIR, EPISODE_LEN
+from config import (SEED, N_TRAIN_SERIES, N_TEST_SERIES, N_TRAIN_DAYS, N_TEST_DAYS,
+                    OUTPUT_DIR)
 from data import prepare_datasets, prepare_test_data
 from model import KDAPolicyNetwork
 from train import train_grpo
@@ -62,18 +63,6 @@ def create_models(device, is_main, world_size, local_rank):
         p.requires_grad = False
 
     raw_policy = policy  # keep uncompiled reference for evaluation
-
-    policy = torch.compile(policy)
-
-    # Warmup: trigger JIT compilation on every rank before DDP wraps the model.
-    # Without this barrier, ranks finish compilation at different times and
-    # deadlock on the first DDP all-reduce.
-    if world_size > 1:
-        with torch.no_grad():
-            _ = policy(torch.randn(EPISODE_LEN, 14, device=device))
-        if is_main:
-            print("Compile warmup done on all ranks.")
-        dist.barrier()
 
     if is_main:
         n_params = sum(p.numel() for p in policy.parameters())
