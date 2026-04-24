@@ -91,8 +91,8 @@ class MiniKDALayer(nn.Module):
     def forward(self, x_seq):
         T, d = x_seq.shape
         positions = torch.arange(T, device=x_seq.device)
-        q = self._apply_pope(self.W_q(x_seq), positions, is_query=True)
-        k = self._apply_pope(self.W_k(x_seq), positions, is_query=False)
+        q = self._apply_pope(F.normalize(self.W_q(x_seq), dim=-1), positions, is_query=True)
+        k = self._apply_pope(F.normalize(self.W_k(x_seq), dim=-1), positions, is_query=False)
         v = F.silu(self.W_v(x_seq))
         alpha = F.sigmoid(self.alpha_down(
             F.silu(self.alpha_gate(x_seq)) * self.alpha_up(x_seq)))
