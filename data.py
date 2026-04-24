@@ -227,24 +227,26 @@ def prepare_datasets(device):
     print(f"  Done.")
 
     # build DataFrames
+    print(f"  Building DataFrames...")
     prices_list = [
         pd.DataFrame({
             "date": pd.date_range("2016-01-01", periods=len(prices_arrays[i]), freq="B"),
             "close": prices_arrays[i], "series_id": i})
         for i in range(N_SERIES)]
 
+    print(f"  Computing features ({N_SERIES} series)...")
     feat_list = [compute_mmn_features(prices_list[i]) for i in range(N_SERIES)]
     df_feat = pd.concat(feat_list, ignore_index=True)
     feat_cols = [f"d_mm_min_{w}" for w in WINDOWS] + [f"d_mm_max_{w}" for w in WINDOWS]
 
-    # fit scaler on all training series combined
+    print(f"  Fitting scaler ({len(df_feat)} samples)...")
     train_df = df_feat[df_feat["series_id"].isin(TRAIN_IDS)].reset_index(drop=True)
     test_df  = df_feat[df_feat["series_id"].isin(TEST_IDS)].reset_index(drop=True)
 
     scaler = StandardScaler()
     scaler.fit(train_df[feat_cols].values)
 
-    # per-series GPU tensors
+    print(f"  Uploading to GPU...")
     train_feats, train_rets = [], []
     for sid in TRAIN_IDS:
         m = train_df["series_id"] == sid
