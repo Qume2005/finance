@@ -161,9 +161,11 @@ def prepare_datasets(device):
             "date": pd.date_range("2016-01-01", periods=len(p), freq="B"),
             "close": p, "series_id": i})
         prices_list.append(df)
-        print(f"  Series {i} ({'train' if i in TRAIN_IDS else 'test':>5}): "
+        print(f"\r  [{i+1}/{N_SERIES}] Series {i} ({'train' if i in TRAIN_IDS else 'test':>5}): "
               f"days={n_days}  market={market_type:<7}  "
-              f"return={annual_return:+.1%}")
+              f"return={annual_return:+.1%}", end="", flush=True)
+
+    print()  # finish progress line
 
     feat_list = [compute_mmn_features(prices_list[i]) for i in range(N_SERIES)]
     df_feat = pd.concat(feat_list, ignore_index=True)
