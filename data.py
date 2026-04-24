@@ -1,0 +1,116 @@
+"""Data generation, feature engineering, and dataset preparation."""
+
+import numpy as np
+import pandas as pd
+import torch
+from sklearn.preprocessing import StandardScaler
+
+from config import SEED, WINDOWS, N_TRAIN, N_TEST, N_DAYS, N_SERIES, TRAIN_IDS, TEST_IDS
+
+
+def generate_price_series(n_days=N_DAYS, annual_return=0.08,
+                          daily_vol=0.06, seed=None):
+    if seed is not None:
+        np.random.seed(seed)
+    daily_drift = annual_return / 252
+    log_trend = np.cumsum(np.full(n_days, daily_drift))
+    # random walk (double vol)
+    noise_rw = np.cumsum(np.random.normal(0, daily_vol, n_days))
+    # mean-reverting (OU) — faster, stronger
+    theta, sigma_ou = 0.08, daily_vol * 0.7
+    noise_ou = np.zeros(n_days)
+    for t in range(1, n_days):
+        noise_ou[t] = noise_ou[t-1]*(1-theta) + np.random.normal(0, sigma_ou)
+    # regime-switching volatility clusters
+    regime = np.zeros(n_days)
+    r = 0
+    for t in range(n_days):
+        if np.random.rand() < 0.02:
+            r = 1 - r  # switch regime
+        regime[t] = r
+    vol_cluster = np.random.normal(0, 1, n_days) * daily_vol * (1 + 2 * regime)
+    vol_cluster = np.cumsum(vol_cluster * 0.3)
+    # jumps — more frequent, bigger
+    n_jumps = n_days // 20
+    jt = np.random.choice(n_days, n_jumps, replace=False)
+    noise_jump = np.zeros(n_days)
+    noise_jump[jt] = np.random.normal(0, daily_vol*5, n_jumps)
+    # GARCH-like volatility feedback
+    garch = np.zeros(n_days)
+    garch[0] = daily_vol
+    omega, alpha_g, beta_g = 1e-5, 0.15, 0.8
+    for t in range(1, n_days):
+        garch[t] = np.sqrt(omega + alpha_g * noise_rw[t-1]**2 + beta_g * garch[t-1]**2)
+    noise_garch = np.random.normal(0, 1, n_days) * garch
+    log_price = log_trend + noise_rw + noise_ou + noise_jump + vol_cluster + noise_garch
+    # A-stock ±10% limit
+    lr = np.diff(log_price)
+    lr = np.clip(lr, np.log(0.9), np.log(1.1))
+    log_price = np.concatenate([[log_price[0]], np.cumsum(lr)])
+    return np.exp(log_price) * 100
+
+
+def compute_mmn_features(df):
+    log_c = np.log(df["close"].values)
+    feat = {}
+    for w in WINDOWS:
+        s = pd.Series(log_c)
+        mm_min = s.rolling(w, min_periods=w).min()
+        mm_max = s.rolling(w, min_periods=w).max()
+        feat[f"d_mm_min_{w}"] = mm_min.diff()
+        feat[f"d_mm_max_{w}"] = mm_max.diff()
+    feat = pd.DataFrame(feat)
+    feat["series_id"] = df["series_id"].values
+    feat["close"]      = df["close"].values
+    feat["daily_return"] = df["close"].pct_change()
+    return feat.dropna().reset_index(drop=True)
+
+
+def prepare_datasets(device):
+    """
+    Generate synthetic data, compute features, split, scale.
+    Returns dict with GPU tensors ready for training.
+    """
+    np.random.seed(SEED)
+    torch.manual_seed(SEED)
+
+    prices_list = []
+    for i in range(N_SERIES):
+        p = generate_price_series(seed=SEED+i)
+        df = pd.DataFrame({
+            "date": pd.date_range("2016-01-01", periods=len(p), freq="B"),
+            "close": p, "series_id": i})
+        prices_list.append(df)
+
+    feat_list = [compute_mmn_features(prices_list[i]) for i in range(N_SERIES)]
+    df_feat = pd.concat(feat_list, ignore_index=True)
+    feat_cols = [f"d_mm_min_{w}" for w in WINDOWS] + [f"d_mm_max_{w}" for w in WINDOWS]
+
+    train_df = df_feat[df_feat["series_id"].isin(TRAIN_IDS)].head(N_TRAIN).reset_index(drop=True)
+    test_df  = df_feat[df_feat["series_id"].isin(TEST_IDS)].head(N_TEST).reset_index(drop=True)
+
+    scaler = StandardScaler()
+    train_X_all = scaler.fit_transform(train_df[feat_cols].values)
+    test_X_all  = scaler.transform(test_df[feat_cols].values)
+
+    train_feats, train_rets = [], []
+    for sid in TRAIN_IDS:
+        m = train_df["series_id"] == sid
+        train_feats.append(torch.FloatTensor(train_X_all[m]).to(device))
+        train_rets.append(torch.FloatTensor(train_df.loc[m, "daily_return"].values).to(device))
+
+    test_feats, test_rets = [], []
+    for sid in TEST_IDS:
+        m = test_df["series_id"] == sid
+        test_feats.append(torch.FloatTensor(test_X_all[m]).to(device))
+        test_rets.append(torch.FloatTensor(test_df.loc[m, "daily_return"].values).to(device))
+
+    return {
+        "prices_list":  prices_list,
+        "feat_cols":    feat_cols,
+        "scaler":       scaler,
+        "train_feats":  train_feats,
+        "train_rets":   train_rets,
+        "test_feats":   test_feats,
+        "test_rets":    test_rets,
+    }
