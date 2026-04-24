@@ -146,6 +146,20 @@ def cleanup_distributed():
 
 
 # ────────────── Step 4: Mini-KDA Policy Network ──────────────
+# ── Compiled KDA step: single-recurrence fused graph ──
+@torch.compile(fullgraph=True)
+def _kda_step(qt, kt, vt, at, bt, S):
+    """
+    One step of KDA delta rule — compiled to a fused static graph.
+    Shapes are all fixed: qt(32), kt(32), vt(16), at(32), bt(1), S(32,16).
+    """
+    aS = at.unsqueeze(1) * S                    # (2*dk, dv)
+    ktaS = kt.unsqueeze(0) @ aS                 # (1, dv)
+    S_new = aS - bt * kt.unsqueeze(1) * ktaS + bt * kt.unsqueeze(1) * vt.unsqueeze(0)
+    ot = S_new.T @ qt                           # (dv,)
+    return ot, S_new
+
+
 class MiniKDALayer(nn.Module):
     """
     Mini Kimi Delta Attention (from Kimi Linear, arXiv 2510.26692).
@@ -214,13 +228,7 @@ class MiniKDALayer(nn.Module):
         S = x_seq.new_zeros(self.dk_pope, self.dv)
         outputs = []
         for t in range(T):
-            qt, kt, vt = q[t], k[t], v[t]
-            at, bt = alpha[t], beta[t]
-            # Delta rule: S = Diag(α)*S − β*k*(k^T Diag(α)*S) + β*k*v^T
-            aS = at.unsqueeze(1) * S                    # (2*dk, dv)
-            ktaS = (kt.unsqueeze(0) @ aS)               # (1, dv)
-            S = aS - bt * kt.unsqueeze(1) * ktaS + bt * kt.unsqueeze(1) * vt.unsqueeze(0)
-            ot = S.T @ qt                                # (dv,)
+            ot, S = _kda_step(q[t], k[t], v[t], alpha[t], beta[t], S)
             outputs.append(ot)
         out = torch.stack(outputs)                       # (T, dv)
 
@@ -354,7 +362,7 @@ def main():
         print(f"Train: {sum(f.shape[0] for f in train_feats_by_series)} samples")
         print(f"Test : {sum(f.shape[0] for f in test_feats_by_series)} samples")
 
-    # ────────────── Step 4: Model + torch.compile + DDP ──────────────
+    # ────────────── Step 4: Model + DDP ──────────────
     # Same seed on all ranks → identical initial weights
     torch.manual_seed(SEED)
     policy = KDAPolicyNetwork().to(device)
@@ -371,18 +379,12 @@ def main():
         n_params = sum(p.numel() for p in policy.parameters())
         print(f"Parameters: {n_params:,}")
 
-    # torch.compile: unrolls KDA sequential loop into a fused static graph
-    if is_main:
-        print("Compiling models with torch.compile ...")
-    policy     = torch.compile(policy)
-    ref_policy = torch.compile(ref_policy)
-
     # DDP: gradient all-reduce across GPUs
     if world_size > 1:
         policy = DDP(policy, device_ids=[local_rank])
 
     if is_main:
-        print("Model ready (compiled + DDP).")
+        print("Model ready (DDP).")
 
     # ────────────── Step 5: GRPO Training ──────────────
     # Per-rank seeds → each GPU samples different episodes for diversity
@@ -611,7 +613,6 @@ Training: GRPO (from DeepSeekMath)
   - No critic/value model needed
   - Group-relative advantage estimation (G=24 samples)
   - Reward = log_return − λ·max_drawdown  (λ=2.0)
-  - torch.compile static graph compilation
   - DDP multi-GPU via torchrun
 
 Key observations:
