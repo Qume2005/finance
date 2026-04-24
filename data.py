@@ -11,50 +11,111 @@ from config import (SEED, WINDOWS,
                     TRAIN_IDS, TEST_IDS)
 
 
-def generate_price_series(n_days, annual_return=0.08,
-                          daily_vol=0.06, theta_ou=0.08,
-                          regime_switch=0.02, jump_freq=20,
+# ── A-stock market parameter tables ──────────────────────────────
+MARKET_PARAMS = {
+    "main": {
+        "daily_drift": 0.0002, "bull_drift": 0.0003, "bear_drift": -0.0002,
+        "daily_vol": 0.0113,
+        "omega": 5e-5, "beta": 0.88, "alpha": 0.10, "gamma": -0.06,
+        "jump_prob": 0.008, "jump_mean": -0.008, "jump_std": 0.015,
+        "limit": 0.10, "st_limit": 0.05,
+    },
+    "chinext": {
+        "daily_drift": 0.0003, "bull_drift": 0.00045, "bear_drift": -0.0003,
+        "daily_vol": 0.0189,
+        "omega": 1.5e-4, "beta": 0.85, "alpha": 0.12, "gamma": -0.10,
+        "jump_prob": 0.012, "jump_mean": -0.012, "jump_std": 0.020,
+        "limit": 0.20, "st_limit": 0.20,
+    },
+    "star": {
+        "daily_drift": 0.0004, "bull_drift": 0.0006, "bear_drift": -0.0004,
+        "daily_vol": 0.0221,
+        "omega": 2e-4, "beta": 0.82, "alpha": 0.15, "gamma": -0.13,
+        "jump_prob": 0.015, "jump_mean": -0.015, "jump_std": 0.025,
+        "limit": 0.20, "st_limit": 0.20,
+    },
+}
+
+
+def generate_price_series(n_days, market_type="main", annual_return=None,
                           max_dd=0.9, seed=None):
+    """
+    6-layer A-stock price generator:
+      L1  market state machine  (bull / bear / range)
+      L2  GJR-GARCH volatility  (leverage effect)
+      L3  base shock
+      L4  jump injection        (fat tail + negative skew)
+      L5  limit constraints     (+ magnetic effect)
+      L6  price synthesis
+    """
     if seed is not None:
         np.random.seed(seed)
-    daily_drift = annual_return / 252
-    log_trend = np.cumsum(np.full(n_days, daily_drift))
-    # random walk (double vol)
-    noise_rw = np.cumsum(np.random.normal(0, daily_vol, n_days))
-    # mean-reverting (OU)
-    sigma_ou = daily_vol * 0.7
-    noise_ou = np.zeros(n_days)
-    for t in range(1, n_days):
-        noise_ou[t] = noise_ou[t-1]*(1-theta_ou) + np.random.normal(0, sigma_ou)
-    # regime-switching volatility clusters
-    regime = np.zeros(n_days)
-    r = 0
+
+    p = MARKET_PARAMS[market_type]
+    mu = annual_return / 252 if annual_return is not None else p["daily_drift"]
+
+    # state-dependent: drift, vol scale, jump mean
+    drifts     = [mu,              p["bull_drift"],     p["bear_drift"]]
+    vol_scales = [1.0,             0.8,                  1.3]
+    jump_means = [p["jump_mean"],  p["jump_mean"]+0.003, p["jump_mean"]-0.012]
+
+    # pre-generate all randomness
+    z       = np.random.normal(0, 1, n_days)
+    u_jump  = np.random.uniform(0, 1, n_days)
+    j_z     = np.random.normal(0, 1, n_days)
+    u_state = np.random.uniform(0, 1, n_days)
+    u_mag   = np.random.uniform(0, 1, n_days)
+
+    sigma2    = np.empty(n_days)
+    sigma2[0] = p["daily_vol"] ** 2
+    log_rets  = np.empty(n_days)
+
+    state, state_age = 0, 0          # 0=range  1=bull  2=bear
+
     for t in range(n_days):
-        if np.random.rand() < regime_switch:
-            r = 1 - r  # switch regime
-        regime[t] = r
-    vol_cluster = np.random.normal(0, 1, n_days) * daily_vol * (1 + 2 * regime)
-    vol_cluster = np.cumsum(vol_cluster * 0.3)
-    # jumps
-    n_jumps = max(n_days // jump_freq, 1)
-    jt = np.random.choice(n_days, n_jumps, replace=False)
-    noise_jump = np.zeros(n_days)
-    noise_jump[jt] = np.random.normal(0, daily_vol*5, n_jumps)
-    # GARCH-like volatility feedback
-    garch = np.zeros(n_days)
-    garch[0] = daily_vol
-    omega, alpha_g, beta_g = 1e-5, 0.15, 0.8
-    for t in range(1, n_days):
-        garch[t] = np.sqrt(omega + alpha_g * noise_rw[t-1]**2 + beta_g * garch[t-1]**2)
-    noise_garch = np.random.normal(0, 1, n_days) * garch
-    log_price = log_trend + noise_rw + noise_ou + noise_jump + vol_cluster + noise_garch
-    # A-stock ±10% limit
-    lr = np.diff(log_price)
-    lr = np.clip(lr, np.log(0.9), np.log(1.1))
-    log_price = np.concatenate([[log_price[0]], np.cumsum(lr)])
-    # drawdown 上限：价格不低于历史高点的 (1 - max_dd)
+        # ── L1: state machine ──
+        state_age += 1
+        if state_age > 20 and u_state[t] < 0.02:
+            others = [s for s in (0, 1, 2) if s != state]
+            state = others[0] if u_state[t] < 0.01 else others[1]
+            state_age = 0
+
+        # ── L3: base shock ──
+        r_base = drifts[state] + np.sqrt(sigma2[t]) * vol_scales[state] * z[t]
+
+        # ── L4: jump injection ──
+        if u_jump[t] < p["jump_prob"]:
+            r_raw = r_base + jump_means[state] + p["jump_std"] * j_z[t]
+        else:
+            r_raw = r_base
+
+        # ── L5: limit + magnetic effect ──
+        lim = p["limit"]
+        if r_raw > lim * 0.80 and u_mag[t] < 0.70:
+            r_eff = lim
+        elif r_raw < -lim * 0.80 and u_mag[t] < 0.70:
+            r_eff = -lim
+        else:
+            r_eff = max(-lim, min(lim, r_raw))
+
+        log_rets[t] = np.log(1.0 + r_eff)
+
+        # ── L2: GJR-GARCH (feeds back clipped return) ──
+        if t < n_days - 1:
+            eps2 = r_eff * r_eff
+            neg  = 1.0 if r_eff < 0 else 0.0
+            sigma2[t + 1] = (p["omega"]
+                             + p["beta"]  * sigma2[t]
+                             + p["alpha"] * eps2
+                             + p["gamma"] * eps2 * neg)
+
+    # ── L6: price synthesis ──
+    log_price = np.cumsum(log_rets)
+
+    # drawdown floor
     log_peak = np.maximum.accumulate(log_price)
     log_price = np.maximum(log_price, log_peak + np.log(1 - max_dd))
+
     return np.exp(log_price) * 100
 
 
@@ -77,8 +138,8 @@ def compute_mmn_features(df):
 def prepare_datasets(device):
     """
     Generate synthetic data, compute features, split, scale.
+    - 每条序列随机分配市场类型（主板/创业板/科创板）
     - 训练序列生成 N_TRAIN_DAYS 天，测试序列生成 N_TEST_DAYS 天
-    - 每条序列去掉 WARMUP 行后取全部样本
     Returns dict with GPU tensors ready for training.
     """
     np.random.seed(SEED)
@@ -86,27 +147,23 @@ def prepare_datasets(device):
 
     param_rng = np.random.RandomState(SEED)
     prices_list = []
+    market_types = ["main", "chinext", "star"]
+    market_weights = [0.60, 0.25, 0.15]
 
     for i in range(N_SERIES):
-        annual_return = param_rng.uniform(-0.05, 0.25)    # 漂移: -5% ~ +25%
-        daily_vol     = param_rng.uniform(0.03, 0.10)     # 波动率: 3% ~ 10%
-        theta_ou      = param_rng.uniform(0.02, 0.15)     # OU 回归速度
-        regime_switch = param_rng.uniform(0.01, 0.05)     # 制度切换概率
-        jump_freq     = param_rng.randint(10, 40)         # 跳跃频率 (1/N天)
+        market_type   = param_rng.choice(market_types, p=market_weights)
+        annual_return = param_rng.uniform(-0.05, 0.25)
         n_days = N_TRAIN_DAYS if i in TRAIN_IDS else N_TEST_DAYS
         p = generate_price_series(
             n_days=n_days, seed=SEED+i,
-            annual_return=annual_return, daily_vol=daily_vol,
-            theta_ou=theta_ou, regime_switch=regime_switch,
-            jump_freq=jump_freq)
+            market_type=market_type, annual_return=annual_return)
         df = pd.DataFrame({
             "date": pd.date_range("2016-01-01", periods=len(p), freq="B"),
             "close": p, "series_id": i})
         prices_list.append(df)
         print(f"  Series {i} ({'train' if i in TRAIN_IDS else 'test':>5}): "
-              f"days={n_days}  return={annual_return:+.1%}  vol={daily_vol:.1%}  "
-              f"theta_ou={theta_ou:.3f}  regime_p={regime_switch:.3f}  "
-              f"jump_freq=1/{jump_freq}")
+              f"days={n_days}  market={market_type:<7}  "
+              f"return={annual_return:+.1%}")
 
     feat_list = [compute_mmn_features(prices_list[i]) for i in range(N_SERIES)]
     df_feat = pd.concat(feat_list, ignore_index=True)
