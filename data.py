@@ -5,13 +5,16 @@ import pandas as pd
 import torch
 from sklearn.preprocessing import StandardScaler
 
-from config import SEED, WINDOWS, N_TRAIN, N_TEST, N_DAYS, N_SERIES, TRAIN_IDS, TEST_IDS
+from config import (SEED, WINDOWS,
+                    N_TRAIN_SERIES, N_TEST_SERIES, N_SERIES,
+                    N_TRAIN_DAYS, N_TEST_DAYS, WARMUP,
+                    TRAIN_IDS, TEST_IDS)
 
 
-def generate_price_series(n_days=N_DAYS, annual_return=0.08,
+def generate_price_series(n_days, annual_return=0.08,
                           daily_vol=0.06, theta_ou=0.08,
                           regime_switch=0.02, jump_freq=20,
-                          seed=None):
+                          max_dd=0.9, seed=None):
     if seed is not None:
         np.random.seed(seed)
     daily_drift = annual_return / 252
@@ -49,6 +52,9 @@ def generate_price_series(n_days=N_DAYS, annual_return=0.08,
     lr = np.diff(log_price)
     lr = np.clip(lr, np.log(0.9), np.log(1.1))
     log_price = np.concatenate([[log_price[0]], np.cumsum(lr)])
+    # drawdown 上限：价格不低于历史高点的 (1 - max_dd)
+    log_peak = np.maximum.accumulate(log_price)
+    log_price = np.maximum(log_price, log_peak + np.log(1 - max_dd))
     return np.exp(log_price) * 100
 
 
@@ -71,28 +77,34 @@ def compute_mmn_features(df):
 def prepare_datasets(device):
     """
     Generate synthetic data, compute features, split, scale.
+    - 训练序列生成 N_TRAIN_DAYS 天，测试序列生成 N_TEST_DAYS 天
+    - 每条序列去掉 WARMUP 行后取全部样本
     Returns dict with GPU tensors ready for training.
     """
     np.random.seed(SEED)
     torch.manual_seed(SEED)
 
-    prices_list = []
     param_rng = np.random.RandomState(SEED)
+    prices_list = []
+
     for i in range(N_SERIES):
         annual_return = param_rng.uniform(-0.05, 0.25)    # 漂移: -5% ~ +25%
         daily_vol     = param_rng.uniform(0.03, 0.10)     # 波动率: 3% ~ 10%
         theta_ou      = param_rng.uniform(0.02, 0.15)     # OU 回归速度
         regime_switch = param_rng.uniform(0.01, 0.05)     # 制度切换概率
         jump_freq     = param_rng.randint(10, 40)         # 跳跃频率 (1/N天)
+        n_days = N_TRAIN_DAYS if i in TRAIN_IDS else N_TEST_DAYS
         p = generate_price_series(
-            seed=SEED+i, annual_return=annual_return,
-            daily_vol=daily_vol, theta_ou=theta_ou,
-            regime_switch=regime_switch, jump_freq=jump_freq)
+            n_days=n_days, seed=SEED+i,
+            annual_return=annual_return, daily_vol=daily_vol,
+            theta_ou=theta_ou, regime_switch=regime_switch,
+            jump_freq=jump_freq)
         df = pd.DataFrame({
             "date": pd.date_range("2016-01-01", periods=len(p), freq="B"),
             "close": p, "series_id": i})
         prices_list.append(df)
-        print(f"  Series {i}: return={annual_return:+.1%}  vol={daily_vol:.1%}  "
+        print(f"  Series {i} ({'train' if i in TRAIN_IDS else 'test':>5}): "
+              f"days={n_days}  return={annual_return:+.1%}  vol={daily_vol:.1%}  "
               f"theta_ou={theta_ou:.3f}  regime_p={regime_switch:.3f}  "
               f"jump_freq=1/{jump_freq}")
 
@@ -100,23 +112,26 @@ def prepare_datasets(device):
     df_feat = pd.concat(feat_list, ignore_index=True)
     feat_cols = [f"d_mm_min_{w}" for w in WINDOWS] + [f"d_mm_max_{w}" for w in WINDOWS]
 
-    train_df = df_feat[df_feat["series_id"].isin(TRAIN_IDS)].head(N_TRAIN).reset_index(drop=True)
-    test_df  = df_feat[df_feat["series_id"].isin(TEST_IDS)].head(N_TEST).reset_index(drop=True)
+    # fit scaler on all training series combined
+    train_df = df_feat[df_feat["series_id"].isin(TRAIN_IDS)].reset_index(drop=True)
+    test_df  = df_feat[df_feat["series_id"].isin(TEST_IDS)].reset_index(drop=True)
 
     scaler = StandardScaler()
-    train_X_all = scaler.fit_transform(train_df[feat_cols].values)
-    test_X_all  = scaler.transform(test_df[feat_cols].values)
+    scaler.fit(train_df[feat_cols].values)
 
+    # per-series GPU tensors
     train_feats, train_rets = [], []
     for sid in TRAIN_IDS:
         m = train_df["series_id"] == sid
-        train_feats.append(torch.FloatTensor(train_X_all[m]).to(device))
+        X = scaler.transform(train_df.loc[m, feat_cols].values)
+        train_feats.append(torch.FloatTensor(X).to(device))
         train_rets.append(torch.FloatTensor(train_df.loc[m, "daily_return"].values).to(device))
 
     test_feats, test_rets = [], []
     for sid in TEST_IDS:
         m = test_df["series_id"] == sid
-        test_feats.append(torch.FloatTensor(test_X_all[m]).to(device))
+        X = scaler.transform(test_df.loc[m, feat_cols].values)
+        test_feats.append(torch.FloatTensor(X).to(device))
         test_rets.append(torch.FloatTensor(test_df.loc[m, "daily_return"].values).to(device))
 
     return {

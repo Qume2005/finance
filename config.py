@@ -3,15 +3,19 @@
 SEED = 42
 WINDOWS = [5, 10, 20, 30, 50, 100, 200]
 
-# Data
-N_TRAIN  = 7000
-N_TEST   = 3000
-N_DAYS   = N_TRAIN + N_TEST + 250  # 250-day warm-up buffer
-N_SERIES = 2
+# ── 序列数量 ──
+N_TRAIN_SERIES = 10       # 训练序列数
+N_TEST_SERIES  = 5        # 测试序列数
+N_SERIES = N_TRAIN_SERIES + N_TEST_SERIES
 
-# Train / Test series assignment
-TRAIN_IDS = [0]
-TEST_IDS  = [1]
+# ── 每条序列的样本长度（含 warm-up buffer）──
+N_TRAIN_DAYS = 12000      # 每条训练序列的原始天数
+N_TEST_DAYS  = 5000       # 每条测试序列的原始天数
+WARMUP = 250              # rolling window 的 warm-up 天数
+
+# ── 序列分配（自动）──
+TRAIN_IDS = list(range(N_TRAIN_SERIES))
+TEST_IDS  = list(range(N_TRAIN_SERIES, N_SERIES))
 
 # GRPO
 EPISODE_LEN = 200

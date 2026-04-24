@@ -36,15 +36,15 @@ def backtest_series(policy, feats, rets, label=""):
     bh_peak     = torch.cummax(bh_eq, dim=0).values
     bh_dd       = (bh_peak - bh_eq) / (bh_peak + 1e-8)
 
-    strat_maxdd = strat_dd.max().item()
-    bh_maxdd    = bh_dd.max().item()
+    strat_maxdd = min(strat_dd.max().item(), 1.0)
+    bh_maxdd    = min(bh_dd.max().item(), 1.0)
 
     strat_sharpe = (strat_daily.mean() / (strat_daily.std() + 1e-8) * math.sqrt(252)).item()
     bh_sharpe    = (rets_f.mean() / (rets_f.std() + 1e-8) * math.sqrt(252)).item()
 
     n_days = positions.shape[0]
     strat_calmar = ((strat_total ** (252/n_days) - 1)) / (strat_maxdd + 1e-8)
-    bh_calmar    = ((bh_total ** (252/n_days) - 1)) / (bh_maxdd + 1e-8)
+    bh_calmar = 0.0 if bh_total < 1e-10 else ((bh_total ** (252/n_days) - 1)) / (bh_maxdd + 1e-8)
 
     metrics = {
         "strat_total": strat_total, "bh_total": bh_total,

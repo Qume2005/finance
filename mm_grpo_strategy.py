@@ -16,7 +16,7 @@ matplotlib.use("Agg")
 
 warnings.filterwarnings("ignore")
 
-from config import SEED, N_SERIES, N_DAYS, OUTPUT_DIR
+from config import SEED, N_TRAIN_SERIES, N_TEST_SERIES, N_TRAIN_DAYS, N_TEST_DAYS, OUTPUT_DIR
 from data import prepare_datasets
 from model import KDAPolicyNetwork
 from train import train_grpo
@@ -88,9 +88,10 @@ def main():
     data = prepare_datasets(device)
 
     if is_main:
-        print(f"Generated {N_SERIES} series × {N_DAYS} days")
-        print(f"Train: {sum(f.shape[0] for f in data['train_feats'])} samples")
-        print(f"Test : {sum(f.shape[0] for f in data['test_feats'])} samples")
+        print(f"Generated {N_TRAIN_SERIES} train series × {N_TRAIN_DAYS} days  +  "
+              f"{N_TEST_SERIES} test series × {N_TEST_DAYS} days")
+        print(f"Train: {sum(f.shape[0] for f in data['train_feats'])} samples  "
+              f"Test: {sum(f.shape[0] for f in data['test_feats'])} samples")
         plot_prices(data["prices_list"], output_dir=OUTPUT_DIR)
 
     # ──── Step 2: Model ────
