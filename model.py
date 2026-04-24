@@ -96,7 +96,7 @@ class MiniKDALayer(nn.Module):
         v = F.silu(self.W_v(x_seq))
         alpha = F.sigmoid(self.alpha_down(
             F.silu(self.alpha_gate(x_seq)) * self.alpha_up(x_seq)))
-        beta = F.silu(self.W_beta(x_seq))
+        beta = torch.sigmoid(self.W_beta(x_seq))
 
         S = x_seq.new_zeros(self.dk_pope, self.dv)
         outputs = []
