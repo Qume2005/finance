@@ -6,10 +6,9 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 
-@torch.compile(fullgraph=True)
 def _kda_step(qt, kt, vt, at, bt, S):
     """
-    One step of KDA delta rule — compiled to a fused static graph.
+    One step of KDA delta rule.
     Shapes are all fixed: qt(32), kt(32), vt(16), at(32), bt(1), S(32,16).
     """
     aS = at.unsqueeze(1) * S                    # (2*dk, dv)
