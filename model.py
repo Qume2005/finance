@@ -6,14 +6,6 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 
-def _kda_step(qt, kt, vt, at, bt, S):
-    aS = at.unsqueeze(1) * S
-    ktaS = kt.unsqueeze(0) @ aS
-    S_new = aS - bt * kt.unsqueeze(1) * ktaS + bt * kt.unsqueeze(1) * vt.unsqueeze(0)
-    ot = S_new.T @ qt
-    return ot, S_new
-
-
 def sinkhorn_knopp(M, n_iters=20):
     """Project (..., n, n) to doubly stochastic matrix."""
     M = torch.exp(M)
@@ -71,7 +63,6 @@ class MiniKDALayer(nn.Module):
         self.alpha_gate = nn.Linear(d_input, d_alpha, bias=False)
         self.alpha_up   = nn.Linear(d_input, d_alpha, bias=False)
         self.alpha_down = nn.Linear(d_alpha, self.dk_pope, bias=False)
-        self.W_beta = nn.Linear(d_input, 1, bias=False)
         self.post_norm = nn.RMSNorm(d_value)
         d_d = int(d_value / 1.618)
         self.W_d = nn.Linear(d_input, d_d, bias=False)
@@ -96,14 +87,12 @@ class MiniKDALayer(nn.Module):
         v = F.silu(self.W_v(x_seq))
         alpha = F.sigmoid(self.alpha_down(
             F.silu(self.alpha_gate(x_seq)) * self.alpha_up(x_seq)))
-        beta = torch.sigmoid(self.W_beta(x_seq))
-
         S = x_seq.new_zeros(self.dk_pope, self.dv)
-        outputs = []
+        out = x_seq.new_empty(T, self.dv)
         for t in range(T):
-            ot, S = _kda_step(q[t], k[t], v[t], alpha[t], beta[t], S)
-            outputs.append(ot)
-        out = torch.stack(outputs)
+            aS = alpha[t].unsqueeze(1) * S
+            S = aS - torch.outer(k[t], k[t] @ aS) + torch.outer(k[t], v[t])
+            out[t] = q[t] @ S
 
         out = self.post_norm(out)
         out = out * torch.sigmoid(self.W_u(F.silu(self.W_d(x_seq))))

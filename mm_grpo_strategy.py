@@ -60,7 +60,9 @@ def create_models(device, is_main, world_size, local_rank):
     for p in ref_policy.parameters():
         p.requires_grad = False
 
-    raw_policy = policy  # keep unwrapped reference for evaluation
+    raw_policy = policy  # keep uncompiled reference for evaluation
+
+    policy = torch.compile(policy)
 
     if is_main:
         n_params = sum(p.numel() for p in policy.parameters())
