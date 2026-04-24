@@ -9,29 +9,31 @@ from config import SEED, WINDOWS, N_TRAIN, N_TEST, N_DAYS, N_SERIES, TRAIN_IDS, 
 
 
 def generate_price_series(n_days=N_DAYS, annual_return=0.08,
-                          daily_vol=0.06, seed=None):
+                          daily_vol=0.06, theta_ou=0.08,
+                          regime_switch=0.02, jump_freq=20,
+                          seed=None):
     if seed is not None:
         np.random.seed(seed)
     daily_drift = annual_return / 252
     log_trend = np.cumsum(np.full(n_days, daily_drift))
     # random walk (double vol)
     noise_rw = np.cumsum(np.random.normal(0, daily_vol, n_days))
-    # mean-reverting (OU) — faster, stronger
-    theta, sigma_ou = 0.08, daily_vol * 0.7
+    # mean-reverting (OU)
+    sigma_ou = daily_vol * 0.7
     noise_ou = np.zeros(n_days)
     for t in range(1, n_days):
-        noise_ou[t] = noise_ou[t-1]*(1-theta) + np.random.normal(0, sigma_ou)
+        noise_ou[t] = noise_ou[t-1]*(1-theta_ou) + np.random.normal(0, sigma_ou)
     # regime-switching volatility clusters
     regime = np.zeros(n_days)
     r = 0
     for t in range(n_days):
-        if np.random.rand() < 0.02:
+        if np.random.rand() < regime_switch:
             r = 1 - r  # switch regime
         regime[t] = r
     vol_cluster = np.random.normal(0, 1, n_days) * daily_vol * (1 + 2 * regime)
     vol_cluster = np.cumsum(vol_cluster * 0.3)
-    # jumps — more frequent, bigger
-    n_jumps = n_days // 20
+    # jumps
+    n_jumps = max(n_days // jump_freq, 1)
     jt = np.random.choice(n_days, n_jumps, replace=False)
     noise_jump = np.zeros(n_days)
     noise_jump[jt] = np.random.normal(0, daily_vol*5, n_jumps)
@@ -75,12 +77,24 @@ def prepare_datasets(device):
     torch.manual_seed(SEED)
 
     prices_list = []
+    param_rng = np.random.RandomState(SEED)
     for i in range(N_SERIES):
-        p = generate_price_series(seed=SEED+i)
+        annual_return = param_rng.uniform(-0.05, 0.25)    # 漂移: -5% ~ +25%
+        daily_vol     = param_rng.uniform(0.03, 0.10)     # 波动率: 3% ~ 10%
+        theta_ou      = param_rng.uniform(0.02, 0.15)     # OU 回归速度
+        regime_switch = param_rng.uniform(0.01, 0.05)     # 制度切换概率
+        jump_freq     = param_rng.randint(10, 40)         # 跳跃频率 (1/N天)
+        p = generate_price_series(
+            seed=SEED+i, annual_return=annual_return,
+            daily_vol=daily_vol, theta_ou=theta_ou,
+            regime_switch=regime_switch, jump_freq=jump_freq)
         df = pd.DataFrame({
             "date": pd.date_range("2016-01-01", periods=len(p), freq="B"),
             "close": p, "series_id": i})
         prices_list.append(df)
+        print(f"  Series {i}: return={annual_return:+.1%}  vol={daily_vol:.1%}  "
+              f"theta_ou={theta_ou:.3f}  regime_p={regime_switch:.3f}  "
+              f"jump_freq=1/{jump_freq}")
 
     feat_list = [compute_mmn_features(prices_list[i]) for i in range(N_SERIES)]
     df_feat = pd.concat(feat_list, ignore_index=True)
