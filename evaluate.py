@@ -196,7 +196,7 @@ def plot_prices(prices_list, output_dir=None):
     n = len(prices_list)
     fig, axes = plt.subplots(n, 1, figsize=(14, 2.5*n), sharex=True, squeeze=False)
     for i in range(n):
-        axes[i, 0].plot(prices_list[i]["date"], prices_list[i]["close"], lw=.5)
+        axes[i, 0].plot(prices_list[i]["date"].to_numpy(), prices_list[i]["close"].to_numpy(), lw=.5)
         axes[i, 0].set_ylabel(f"S{i}")
     plt.suptitle("Synthetic A-Stock Price Series", y=1.01)
     plt.tight_layout()

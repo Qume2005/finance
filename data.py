@@ -1,7 +1,8 @@
 """Data generation, feature engineering, and dataset preparation."""
 
 import numpy as np
-import pandas as pd
+import pandas as pd                              # only for bdate_range
+import polars as pl
 import torch
 from sklearn.preprocessing import StandardScaler
 
@@ -174,20 +175,28 @@ def generate_price_series_batch(n_days_list, market_types, annual_returns,
     return [prices_np[i, :lengths_np[i]] for i in range(N)]
 
 
-def compute_mmn_features(df):
-    log_c = np.log(df["close"].values)
-    feat = {}
+def compute_mmn_features(close, series_id):
+    """Compute MMn diff features for a single price series using polars."""
+    log_c = np.log(close)
+
+    feat = pl.DataFrame({"log_c": log_c})
+    exprs = []
     for w in WINDOWS:
-        s = pd.Series(log_c)
-        mm_min = s.rolling(w, min_periods=w).min()
-        mm_max = s.rolling(w, min_periods=w).max()
-        feat[f"d_mm_min_{w}"] = mm_min.diff()
-        feat[f"d_mm_max_{w}"] = mm_max.diff()
-    feat = pd.DataFrame(feat)
-    feat["series_id"] = df["series_id"].values
-    feat["close"]      = df["close"].values
-    feat["daily_return"] = df["close"].pct_change()
-    return feat.dropna().reset_index(drop=True)
+        exprs.append(pl.col("log_c").rolling_min(window_size=w, min_periods=w)
+                     .diff().alias(f"d_mm_min_{w}"))
+        exprs.append(pl.col("log_c").rolling_max(window_size=w, min_periods=w)
+                     .diff().alias(f"d_mm_max_{w}"))
+    feat = feat.with_columns(exprs).drop("log_c")
+
+    daily_ret = np.empty(len(close))
+    daily_ret[0] = np.nan
+    daily_ret[1:] = close[1:] / close[:-1] - 1
+
+    return feat.with_columns([
+        pl.lit(series_id).cast(pl.Int64).alias("series_id"),
+        pl.Series("close", close),
+        pl.Series("daily_return", daily_ret),
+    ]).drop_nulls()
 
 
 def prepare_datasets(device):
@@ -226,40 +235,65 @@ def prepare_datasets(device):
         seed=SEED, device=device)
     print(f"  Done.")
 
-    # build DataFrames
+    # build DataFrames (keep pandas for bdate_range)
     print(f"  Building DataFrames...")
     prices_list = [
-        pd.DataFrame({
-            "date": pd.date_range("2016-01-01", periods=len(prices_arrays[i]), freq="B"),
-            "close": prices_arrays[i], "series_id": i})
+        pl.DataFrame({
+            "date":   pd.bdate_range("2016-01-01", periods=len(prices_arrays[i])).to_numpy(),
+            "close":  prices_arrays[i],
+            "series_id": i,
+        })
         for i in range(N_SERIES)]
 
     print(f"  Computing features ({N_SERIES} series)...")
-    feat_list = [compute_mmn_features(prices_list[i]) for i in range(N_SERIES)]
-    df_feat = pd.concat(feat_list, ignore_index=True)
+    feat_list = []
+    for i in range(N_SERIES):
+        feat_list.append(compute_mmn_features(prices_arrays[i], i))
+        if (i + 1) % 500 == 0 or i == N_SERIES - 1:
+            print(f"\r  Features: {i+1}/{N_SERIES}", end="", flush=True)
+    print()
+
+    df_feat = pl.concat(feat_list, how="vertical")
     feat_cols = [f"d_mm_min_{w}" for w in WINDOWS] + [f"d_mm_max_{w}" for w in WINDOWS]
 
-    print(f"  Fitting scaler ({len(df_feat)} samples)...")
-    train_df = df_feat[df_feat["series_id"].isin(TRAIN_IDS)].reset_index(drop=True)
-    test_df  = df_feat[df_feat["series_id"].isin(TEST_IDS)].reset_index(drop=True)
+    print(f"  Fitting scaler...")
+    train_df = df_feat.filter(pl.col("series_id").is_in(TRAIN_IDS))
+    test_df  = df_feat.filter(pl.col("series_id").is_in(TEST_IDS))
 
     scaler = StandardScaler()
-    scaler.fit(train_df[feat_cols].values)
+    scaler.fit(train_df.select(feat_cols).to_numpy())
 
     print(f"  Uploading to GPU...")
+    # sort + batch transform + numpy slice (avoids per-series filter)
+    train_sorted = train_df.sort("series_id")
+    train_X = scaler.transform(train_sorted.select(feat_cols).to_numpy())
+    train_rets_all = train_sorted["daily_return"].to_numpy()
+    train_sids = train_sorted["series_id"].to_numpy()
+
+    unique_sids, starts = np.unique(train_sids, return_index=True)
+    sid_to_idx = {s: i for i, s in enumerate(unique_sids)}
+    ends = np.concatenate([starts[1:], [len(train_sids)]])
+
     train_feats, train_rets = [], []
     for sid in TRAIN_IDS:
-        m = train_df["series_id"] == sid
-        X = scaler.transform(train_df.loc[m, feat_cols].values)
-        train_feats.append(torch.FloatTensor(X).to(device))
-        train_rets.append(torch.FloatTensor(train_df.loc[m, "daily_return"].values).to(device))
+        j = sid_to_idx[sid]
+        train_feats.append(torch.FloatTensor(train_X[starts[j]:ends[j]]).to(device))
+        train_rets.append(torch.FloatTensor(train_rets_all[starts[j]:ends[j]]).to(device))
+
+    test_sorted = test_df.sort("series_id")
+    test_X = scaler.transform(test_sorted.select(feat_cols).to_numpy())
+    test_rets_all = test_sorted["daily_return"].to_numpy()
+    test_sids = test_sorted["series_id"].to_numpy()
+
+    unique_tsids, tstarts = np.unique(test_sids, return_index=True)
+    tsid_to_idx = {s: i for i, s in enumerate(unique_tsids)}
+    tends = np.concatenate([tstarts[1:], [len(test_sids)]])
 
     test_feats, test_rets = [], []
     for sid in TEST_IDS:
-        m = test_df["series_id"] == sid
-        X = scaler.transform(test_df.loc[m, feat_cols].values)
-        test_feats.append(torch.FloatTensor(X).to(device))
-        test_rets.append(torch.FloatTensor(test_df.loc[m, "daily_return"].values).to(device))
+        j = tsid_to_idx[sid]
+        test_feats.append(torch.FloatTensor(test_X[tstarts[j]:tends[j]]).to(device))
+        test_rets.append(torch.FloatTensor(test_rets_all[tstarts[j]:tends[j]]).to(device))
 
     return {
         "prices_list":  prices_list,
