@@ -36,87 +36,142 @@ MARKET_PARAMS = {
     },
 }
 
+# Column layout for param tensor built from MARKET_PARAMS
+# 0:daily_drift  1:bull_drift  2:bear_drift  3:daily_vol
+# 4:omega  5:beta  6:alpha  7:gamma
+# 8:jump_prob  9:jump_mean  10:jump_std  11:limit
+_MT_ORDER = ["main", "chinext", "star"]
 
-def generate_price_series(n_days, market_type="main", annual_return=None,
-                          max_dd=0.9, seed=None):
+
+def _build_param_table(device):
+    """(3, 12) tensor of market params."""
+    rows = []
+    for mt in _MT_ORDER:
+        mp = MARKET_PARAMS[mt]
+        rows.append([
+            mp["daily_drift"], mp["bull_drift"], mp["bear_drift"], mp["daily_vol"],
+            mp["omega"], mp["beta"], mp["alpha"], mp["gamma"],
+            mp["jump_prob"], mp["jump_mean"], mp["jump_std"], mp["limit"],
+        ])
+    return torch.tensor(rows, device=device)
+
+
+def generate_price_series_batch(n_days_list, market_types, annual_returns,
+                                max_dd=0.9, seed=None, device="cpu"):
     """
-    6-layer A-stock price generator:
-      L1  market state machine  (bull / bear / range)
-      L2  GJR-GARCH volatility  (leverage effect)
-      L3  base shock
-      L4  jump injection        (fat tail + negative skew)
-      L5  limit constraints     (+ magnetic effect)
-      L6  price synthesis
+    Batch-generate all price series in parallel on GPU.
+
+    GJR-GARCH loop iterates over time but processes all N series
+    simultaneously via vectorised tensor ops.
+    Returns list of numpy price arrays.
     """
     if seed is not None:
-        np.random.seed(seed)
+        torch.manual_seed(seed)
 
-    p = MARKET_PARAMS[market_type]
-    mu = annual_return / 252 if annual_return is not None else p["daily_drift"]
+    N = len(n_days_list)
+    max_days = max(n_days_list)
 
-    # state-dependent: drift, vol scale, jump mean
-    drifts     = [mu,              p["bull_drift"],     p["bear_drift"]]
-    vol_scales = [1.0,             0.8,                  1.3]
-    jump_means = [p["jump_mean"],  p["jump_mean"]+0.003, p["jump_mean"]-0.012]
+    # ── per-series parameters ──
+    param_table = _build_param_table(device)                      # (3, 12)
+    mt_idx = torch.tensor([_MT_ORDER.index(mt) for mt in market_types],
+                          device=device)
+    p = param_table[mt_idx]                                       # (N, 12)
 
-    # pre-generate all randomness
-    z       = np.random.normal(0, 1, n_days)
-    u_jump  = np.random.uniform(0, 1, n_days)
-    j_z     = np.random.normal(0, 1, n_days)
-    u_state = np.random.uniform(0, 1, n_days)
-    u_mag   = np.random.uniform(0, 1, n_days)
+    mu       = torch.tensor(annual_returns, device=device) / 252
+    omega    = p[:, 4]
+    beta     = p[:, 5]
+    alpha    = p[:, 6]
+    gamma    = p[:, 7]
+    jmp_prob = p[:, 8]
+    jmp_mean = p[:, 9]
+    jmp_std  = p[:, 10]
+    limit    = p[:, 11]
+    bull_dr  = p[:, 1]
+    bear_dr  = p[:, 2]
+    base_vol = p[:, 3]
 
-    sigma2    = np.empty(n_days)
-    sigma2[0] = p["daily_vol"] ** 2
-    log_rets  = np.empty(n_days)
+    # ── pre-generate all randomness ──
+    z       = torch.randn(N, max_days, device=device)
+    u_jump  = torch.rand(N, max_days, device=device)
+    j_z     = torch.randn(N, max_days, device=device)
+    u_state = torch.rand(N, max_days, device=device)
+    u_mag   = torch.rand(N, max_days, device=device)
 
-    state, state_age = 0, 0          # 0=range  1=bull  2=bear
+    # ── state machine vectors ──
+    state     = torch.zeros(N, dtype=torch.long, device=device)
+    state_age = torch.zeros(N, dtype=torch.long, device=device)
+    vol_scales = torch.tensor([1.0, 0.8, 1.3], device=device)
+    jm_adj     = torch.tensor([0.0, 0.003, -0.012], device=device)
+    trans      = torch.tensor([[1, 2], [0, 2], [0, 1]],
+                              dtype=torch.long, device=device)
 
-    for t in range(n_days):
+    # ── GARCH init ──
+    sigma2 = base_vol ** 2                                       # (N,)
+
+    # ── length mask ──
+    lengths = torch.tensor(n_days_list, dtype=torch.long, device=device)
+    t_range = torch.arange(max_days, device=device)
+    mask = t_range.unsqueeze(0) < lengths.unsqueeze(1)           # (N, max_days)
+
+    log_rets = torch.zeros(N, max_days, device=device)
+
+    for t in range(max_days):
         # ── L1: state machine ──
         state_age += 1
-        if state_age > 20 and u_state[t] < 0.02:
-            others = [s for s in (0, 1, 2) if s != state]
-            state = others[0] if u_state[t] < 0.01 else others[1]
-            state_age = 0
+        switch = (state_age > 20) & (u_state[:, t] < 0.02)
+        rand_pick = (u_state[:, t] < 0.01).long()
+        new_state = trans[state, rand_pick]
+        state     = torch.where(switch, new_state, state)
+        state_age = torch.where(switch, torch.zeros_like(state_age), state_age)
+
+        # state-dependent params
+        cur_drift = torch.where(state == 1, bull_dr,
+                    torch.where(state == 2, bear_dr, mu))
+        cur_vs    = vol_scales[state]
+        cur_jm    = jmp_mean + jm_adj[state]
 
         # ── L3: base shock ──
-        r_base = drifts[state] + np.sqrt(sigma2[t]) * vol_scales[state] * z[t]
+        r_base = cur_drift + sigma2.sqrt() * cur_vs * z[:, t]
 
         # ── L4: jump injection ──
-        if u_jump[t] < p["jump_prob"]:
-            r_raw = r_base + jump_means[state] + p["jump_std"] * j_z[t]
-        else:
-            r_raw = r_base
+        is_jump = u_jump[:, t] < jmp_prob
+        r_raw   = torch.where(is_jump,
+                              r_base + cur_jm + jmp_std * j_z[:, t],
+                              r_base)
 
         # ── L5: limit + magnetic effect ──
-        lim = p["limit"]
-        if r_raw > lim * 0.80 and u_mag[t] < 0.70:
-            r_eff = lim
-        elif r_raw < -lim * 0.80 and u_mag[t] < 0.70:
-            r_eff = -lim
-        else:
-            r_eff = max(-lim, min(lim, r_raw))
+        mag_up   = (r_raw >  limit * 0.80) & (u_mag[:, t] < 0.70)
+        mag_down = (r_raw < -limit * 0.80) & (u_mag[:, t] < 0.70)
+        r_eff    = torch.where(mag_up,  limit,
+                  torch.where(mag_down, -limit,
+                  torch.clamp(r_raw, -limit, limit)))
 
-        log_rets[t] = np.log(1.0 + r_eff)
+        # mask out padded timesteps
+        t_mask   = mask[:, t]
+        r_masked = torch.where(t_mask, r_eff, torch.zeros_like(r_eff))
+        log_rets[:, t] = torch.where(t_mask,
+                                    torch.log(1.0 + r_masked),
+                                    torch.zeros(N, device=device))
 
         # ── L2: GJR-GARCH (feeds back clipped return) ──
-        if t < n_days - 1:
-            eps2 = r_eff * r_eff
-            neg  = 1.0 if r_eff < 0 else 0.0
-            sigma2[t + 1] = (p["omega"]
-                             + p["beta"]  * sigma2[t]
-                             + p["alpha"] * eps2
-                             + p["gamma"] * eps2 * neg)
+        eps2   = r_masked ** 2
+        neg    = (r_masked < 0).float()
+        sigma2 = omega + beta * sigma2 + alpha * eps2 + gamma * eps2 * neg
 
     # ── L6: price synthesis ──
-    log_price = np.cumsum(log_rets)
+    log_price = log_rets.cumsum(dim=1)                            # (N, max_days)
 
     # drawdown floor
-    log_peak = np.maximum.accumulate(log_price)
-    log_price = np.maximum(log_price, log_peak + np.log(1 - max_dd))
+    log_peak = torch.cummax(log_price, dim=1).values
+    log_price = torch.maximum(log_price,
+                              log_peak + np.log(1 - max_dd))
 
-    return np.exp(log_price) * 100
+    prices = torch.exp(log_price) * 100
+
+    # trim to actual lengths → list of numpy arrays
+    prices_np  = prices.cpu().numpy()
+    lengths_np = lengths.cpu().numpy()
+    return [prices_np[i, :lengths_np[i]] for i in range(N)]
 
 
 def compute_mmn_features(df):
@@ -146,26 +201,37 @@ def prepare_datasets(device):
     torch.manual_seed(SEED)
 
     param_rng = np.random.RandomState(SEED)
-    prices_list = []
-    market_types = ["main", "chinext", "star"]
-    market_weights = [0.60, 0.25, 0.15]
+    market_type_list   = []
+    annual_return_list = []
+    n_days_list        = []
+
+    mt_choices = ["main", "chinext", "star"]
+    mt_weights = [0.60, 0.25, 0.15]
 
     for i in range(N_SERIES):
-        market_type   = param_rng.choice(market_types, p=market_weights)
-        annual_return = param_rng.uniform(-0.05, 0.25)
-        n_days = N_TRAIN_DAYS if i in TRAIN_IDS else N_TEST_DAYS
-        p = generate_price_series(
-            n_days=n_days, seed=SEED+i,
-            market_type=market_type, annual_return=annual_return)
-        df = pd.DataFrame({
-            "date": pd.date_range("2016-01-01", periods=len(p), freq="B"),
-            "close": p, "series_id": i})
-        prices_list.append(df)
+        mt = param_rng.choice(mt_choices, p=mt_weights)
+        ar = param_rng.uniform(-0.05, 0.25)
+        nd = N_TRAIN_DAYS if i in TRAIN_IDS else N_TEST_DAYS
+        market_type_list.append(mt)
+        annual_return_list.append(ar)
+        n_days_list.append(nd)
         print(f"\r  [{i+1}/{N_SERIES}] Series {i} ({'train' if i in TRAIN_IDS else 'test':>5}): "
-              f"days={n_days}  market={market_type:<7}  "
-              f"return={annual_return:+.1%}", end="", flush=True)
+              f"days={nd}  market={mt:<7}  return={ar:+.1%}", end="", flush=True)
+    print()
 
-    print()  # finish progress line
+    # batch generate all series on GPU
+    print(f"  Generating {N_SERIES} series on GPU...")
+    prices_arrays = generate_price_series_batch(
+        n_days_list, market_type_list, annual_return_list,
+        seed=SEED, device=device)
+    print(f"  Done.")
+
+    # build DataFrames
+    prices_list = [
+        pd.DataFrame({
+            "date": pd.date_range("2016-01-01", periods=len(prices_arrays[i]), freq="B"),
+            "close": prices_arrays[i], "series_id": i})
+        for i in range(N_SERIES)]
 
     feat_list = [compute_mmn_features(prices_list[i]) for i in range(N_SERIES)]
     df_feat = pd.concat(feat_list, ignore_index=True)
