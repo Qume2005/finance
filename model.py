@@ -79,6 +79,18 @@ class MiniKDALayer(nn.Module):
         imag = mu * torch.sin(phi)
         return torch.cat([real, imag], dim=-1)
 
+    @torch.compiler.disable
+    def _kda_recursion(self, q, k, v, alpha, T):
+        """Sequential KDA update – excluded from torch.compile to avoid
+        unrolling the T-step loop and multi-GPU compilation deadlocks."""
+        S = q.new_zeros(self.dk_pope, self.dv)
+        out = q.new_empty(T, self.dv)
+        for t in range(T):
+            aS = alpha[t].unsqueeze(1) * S
+            S = aS - torch.outer(k[t], k[t] @ aS) + torch.outer(k[t], v[t])
+            out[t] = q[t] @ S
+        return out
+
     def forward(self, x_seq):
         T, d = x_seq.shape
         positions = torch.arange(T, device=x_seq.device)
@@ -87,12 +99,7 @@ class MiniKDALayer(nn.Module):
         v = F.silu(self.W_v(x_seq))
         alpha = F.sigmoid(self.alpha_down(
             F.silu(self.alpha_gate(x_seq)) * self.alpha_up(x_seq)))
-        S = x_seq.new_zeros(self.dk_pope, self.dv)
-        out = x_seq.new_empty(T, self.dv)
-        for t in range(T):
-            aS = alpha[t].unsqueeze(1) * S
-            S = aS - torch.outer(k[t], k[t] @ aS) + torch.outer(k[t], v[t])
-            out[t] = q[t] @ S
+        out = self._kda_recursion(q, k, v, alpha, T)
 
         out = self.post_norm(out)
         out = out * torch.sigmoid(self.W_u(F.silu(self.W_d(x_seq))))
