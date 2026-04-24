@@ -194,11 +194,10 @@ def _save_fig(fig, name, output_dir=None):
 
 def plot_prices(prices_list, output_dir=None):
     n = len(prices_list)
-    fig, axes = plt.subplots(n, 1, figsize=(14, 2.5*n), sharex=True)
+    fig, axes = plt.subplots(n, 1, figsize=(14, 2.5*n), sharex=True, squeeze=False)
     for i in range(n):
-        s = prices_list[i]
-        axes[i].plot(s["date"], s["close"], lw=.5)
-        axes[i].set_ylabel(f"Series {i}")
+        axes[i, 0].plot(prices_list[i]["date"], prices_list[i]["close"], lw=.5)
+        axes[i, 0].set_ylabel(f"S{i}")
     plt.suptitle("Synthetic A-Stock Price Series", y=1.01)
     plt.tight_layout()
     _save_fig(fig, "fig_01_prices.png", output_dir)

@@ -92,7 +92,11 @@ def main():
               f"{N_TEST_SERIES} test series × {N_TEST_DAYS} days")
         print(f"Train: {sum(f.shape[0] for f in data['train_feats'])} samples  "
               f"Test: {sum(f.shape[0] for f in data['test_feats'])} samples")
-        plot_prices(data["prices_list"], output_dir=OUTPUT_DIR)
+        plot_prices([data["prices_list"][i] for i in TEST_IDS], output_dir=OUTPUT_DIR)
+
+    # all ranks must wait for rank 0 to finish plotting before entering DDP
+    if world_size > 1:
+        dist.barrier()
 
     # ──── Step 2: Model ────
     policy, ref_policy, raw_policy = create_models(device, is_main, world_size, local_rank)
