@@ -9,7 +9,6 @@ from torch.distributions import Categorical
 
 from config import (SEED, EPISODE_LEN, G_SAMPLES, LAMBDA_DD,
                     EPS_CLIP, BETA_KL, N_EPISODES, LR, BATCH_SIZE)
-from model import KDAPolicyNetwork
 
 
 def compute_rewards(positions, daily_returns, lam=LAMBDA_DD):
