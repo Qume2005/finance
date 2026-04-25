@@ -146,6 +146,10 @@ class KDAPolicyNetwork(nn.Module):
         self.inp_proj = nn.Sequential(
             nn.Linear(d_input, d_hidden), nn.SiLU(), nn.RMSNorm(d_hidden))
 
+        # pre-norm for each sub-layer, applied to stream before mHC
+        self.stream_norms = nn.ModuleList([
+            nn.RMSNorm(d_hidden) for _ in range(n_layers * 2)])
+
         self.kda_layers = nn.ModuleList([
             MiniKDALayer(d_hidden) for _ in range(n_layers)])
         self.swiglu_layers = nn.ModuleList([
@@ -217,16 +221,15 @@ class KDAPolicyNetwork(nn.Module):
 
         for l in range(self.n_layers):
             # ── Attention ──
+            stream = self.stream_norms[l * 2](stream)
             H_res, H_pre, H_post = self.mhc[l * 2](stream)
             res_stream = torch.einsum('btij,bjtd->bitd', H_res, stream)
             h = torch.einsum('btn,bntd->btd', H_pre, stream)
-            # if len(acc) > 1:
-            #     h = h + self._attn_res(acc, self.w[l * 2])
             out = self.kda_layers[l](h)
             stream = res_stream + torch.einsum('btn,btd->bntd', H_post, out)
-            # acc.append(out)
 
             # ── SwiGLU ──
+            stream = self.stream_norms[l * 2 + 1](stream)
             H_res, H_pre, H_post = self.mhc[l * 2 + 1](stream)
             res_stream = torch.einsum('btij,bjtd->bitd', H_res, stream)
             h = torch.einsum('btn,bntd->btd', H_pre, stream)
