@@ -70,8 +70,7 @@ def create_models(device, is_main, world_size, local_rank):
 
     # DDP: gradient all-reduce across GPUs
     if world_size > 1:
-        policy = DDP(policy, device_ids=[local_rank],
-                      find_unused_parameters=True)
+        policy = DDP(policy, device_ids=[local_rank])
 
     if is_main:
         print("Model ready (DDP).")
