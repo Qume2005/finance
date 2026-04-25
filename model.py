@@ -143,7 +143,7 @@ class KDAPolicyNetwork(nn.Module):
     Input : (T, 14)  MMn diff features
     Output: (T, 11)  logits for positions 0-10
     """
-    def __init__(self, d_input=14, d_hidden=32, n_actions=11, n_layers=4, n_mhc=4):
+    def __init__(self, d_input=14, d_hidden=48, n_actions=11, n_layers=12, n_mhc=4):
         super().__init__()
         self.n_layers = n_layers
         self.n_mhc = n_mhc
