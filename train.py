@@ -9,6 +9,7 @@ from torch.distributions import Categorical
 
 from config import (SEED, EPISODE_LEN, G_SAMPLES, LAMBDA_DD,
                     EPS_CLIP, BETA_KL, N_EPISODES, LR, BATCH_SIZE)
+from muon import Muon
 
 
 def compute_rewards(positions, daily_returns, lam=LAMBDA_DD):
@@ -43,8 +44,8 @@ def train_grpo(policy, ref_policy, train_feats, train_rets,
     for p in policy.parameters():
         (muon_params if p.dim() >= 2 else sgd_params).append(p)
     optimizers = [
-        torch.optim.Muon(muon_params, lr=LR, momentum=0.618),
-        torch.optim.SGD(sgd_params, lr=LR, momentum=0.618),
+        Muon(muon_params, lr=LR, momentum=0.618, weight_decay=1e-2),
+        torch.optim.SGD(sgd_params, lr=LR, momentum=0.618, weight_decay=1e-2),
     ]
     schedulers = [
         torch.optim.lr_scheduler.CosineAnnealingLR(opt, N_EPISODES)
