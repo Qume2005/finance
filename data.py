@@ -2,9 +2,7 @@
 
 import numpy as np
 import pandas as pd                              # only for bdate_range
-import polars as pl
 import torch
-from sklearn.preprocessing import StandardScaler
 
 from config import (SEED, WINDOWS,
                     N_TRAIN_SERIES, N_TEST_SERIES, N_SERIES,
@@ -57,8 +55,59 @@ def _build_param_table(device):
     return torch.tensor(rows, device=device)
 
 
+# ── GPU-native feature computation ─────────────────────────────
+
+def _rolling_op_gpu(x, window, op, chunk_size=2000):
+    """
+    Batched rolling min/max via torch.unfold with chunking for memory control.
+    x:    (N, T) GPU tensor
+    op:   'min' or 'max'
+    returns: (N, T - window + 1)
+    """
+    N, T = x.shape
+    out_len = T - window + 1
+    result = x.new_empty(N, out_len)
+    reduce = torch.min if op == 'min' else torch.max
+    for s in range(0, N, chunk_size):
+        e = min(s + chunk_size, N)
+        w = x[s:e].unfold(1, window, 1)           # (chunk, out_len, window)
+        result[s:e], _ = reduce(w, dim=-1)
+    return result
+
+
+def compute_mmn_batch_gpu(prices):
+    """
+    Batch-compute MMn diff features + daily returns entirely on GPU.
+
+    prices: (N, T) GPU tensor of raw prices
+    returns: feats (N, T-max_window, 14), rets (N, T-max_window,)
+    """
+    max_w = max(WINDOWS)                              # 200
+    log_c = torch.log(prices)                         # (N, T)
+
+    features = []
+    for w in WINDOWS:
+        offset = max_w - w                            # alignment offset
+        rmin = _rolling_op_gpu(log_c, w, 'min')      # (N, T-w+1)
+        d_rmin = rmin[:, 1:] - rmin[:, :-1]           # diff → (N, T-w)
+        features.append(d_rmin[:, offset:])            # (N, T-max_w)
+
+        rmax = _rolling_op_gpu(log_c, w, 'max')
+        d_rmax = rmax[:, 1:] - rmax[:, :-1]
+        features.append(d_rmax[:, offset:])
+
+    feats = torch.stack(features, dim=-1)              # (N, T-200, 14)
+
+    # daily_return aligned to the same rows
+    daily_ret = prices[:, 1:] / prices[:, :-1] - 1    # (N, T-1)
+    rets = daily_ret[:, max_w - 1:]                    # (N, T-200,)
+
+    return feats, rets
+
+
 def generate_price_series_batch(n_days_list, market_types, annual_returns,
-                                max_dd=0.9, seed=None, device="cpu"):
+                                max_dd=0.9, seed=None, device="cpu",
+                                return_tensor=False):
     """
     Batch-generate all price series in parallel on GPU.
 
@@ -169,39 +218,34 @@ def generate_price_series_batch(n_days_list, market_types, annual_returns,
 
     prices = torch.exp(log_price) * 100
 
+    if return_tensor:
+        return prices[:, :lengths.min().item()]
+
     # trim to actual lengths → list of numpy arrays
     prices_np  = prices.cpu().numpy()
     lengths_np = lengths.cpu().numpy()
     return [prices_np[i, :lengths_np[i]] for i in range(N)]
 
 
-def compute_mmn_features(close, series_id):
-    """Compute MMn diff features for a single price series using polars."""
-    log_c = np.log(close)
-
-    feat = pl.DataFrame({"log_c": log_c})
-    exprs = []
-    for w in WINDOWS:
-        exprs.append(pl.col("log_c").rolling_min(window_size=w, min_periods=w)
-                     .diff().alias(f"d_mm_min_{w}"))
-        exprs.append(pl.col("log_c").rolling_max(window_size=w, min_periods=w)
-                     .diff().alias(f"d_mm_max_{w}"))
-    feat = feat.with_columns(exprs).drop("log_c")
-
-    daily_ret = np.empty(len(close))
-    daily_ret[0] = np.nan
-    daily_ret[1:] = close[1:] / close[:-1] - 1
-
-    return feat.with_columns([
-        pl.lit(series_id).cast(pl.Int64).alias("series_id"),
-        pl.Series("close", close),
-        pl.Series("daily_return", daily_ret),
-    ]).drop_nulls()
+def _make_prices_list(prices_arrays):
+    """Build list of polars-style DataFrames (date, close) for plotting. CPU only."""
+    return [
+        pd.DataFrame({
+            "date":   pd.bdate_range("2016-01-01", periods=len(prices_arrays[i])),
+            "close":  prices_arrays[i],
+        })
+        for i in range(len(prices_arrays))
+    ]
 
 
-def _generate_series_block(n_series, n_days, param_rng, seed, device,
-                           mt_choices, mt_weights):
-    """Generate, compute features, and return (prices_list, feat_df, params_info)."""
+def _generate_block_gpu(n_series, n_days, param_rng, seed, device,
+                        mt_choices, mt_weights, need_prices_list=False,
+                        feat_mean=None, feat_std=None):
+    """
+    GPU-native: generate prices → compute features → normalize → per-series tensors.
+    If feat_mean/feat_std provided, uses them (test data); otherwise computes from data (train).
+    Returns (feats_list, rets_list, feat_mean, feat_std) and optionally prices_list.
+    """
     market_types, annual_returns, n_days_list = [], [], []
     for i in range(n_series):
         mt = param_rng.choice(mt_choices, p=mt_weights)
@@ -210,23 +254,36 @@ def _generate_series_block(n_series, n_days, param_rng, seed, device,
         annual_returns.append(ar)
         n_days_list.append(n_days)
 
-    prices_arrays = generate_price_series_batch(
+    # Generate prices on GPU, keep as tensor
+    prices_gpu = generate_price_series_batch(
         n_days_list, market_types, annual_returns,
-        seed=seed, device=device)
+        seed=seed, device=device, return_tensor=True)        # (N, T) GPU
 
-    prices_list = [
-        pl.DataFrame({
-            "date":   pd.bdate_range("2016-01-01", periods=len(prices_arrays[i])).to_numpy(),
-            "close":  prices_arrays[i],
-        })
-        for i in range(n_series)]
+    # Optionally produce CPU prices_list for plotting (test data only)
+    prices_list = None
+    if need_prices_list:
+        prices_np = prices_gpu.cpu().numpy()
+        prices_list = _make_prices_list(prices_np)
 
-    feat_list = [compute_mmn_features(prices_arrays[i], i) for i in range(n_series)]
-    return prices_list, pl.concat(feat_list, how="vertical"), market_types, annual_returns
+    # Batch feature computation on GPU
+    print(f"  Computing MMn features on GPU ({n_series} series)...")
+    feats, rets = compute_mmn_batch_gpu(prices_gpu)           # (N, T-200, 14), (N, T-200,)
+
+    # GPU normalization (equivalent of StandardScaler)
+    if feat_mean is None:
+        feat_mean = feats.mean(dim=(0, 1))                     # (14,)
+        feat_std  = feats.std(dim=(0, 1))                      # (14,)
+    feats_norm = (feats - feat_mean) / (feat_std + 1e-8)
+
+    # Split into per-series tensors (compatible with train.py indexing)
+    feats_list = [feats_norm[i] for i in range(n_series)]
+    rets_list  = [rets[i] for i in range(n_series)]
+
+    return feats_list, rets_list, feat_mean, feat_std, prices_list
 
 
 def _df_to_tensors(df, feat_cols, scaler, series_ids, device):
-    """Sort by series_id, batch-transform, split into per-series GPU tensors."""
+    """Fallback: CPU path for legacy compatibility (unused in GPU pipeline)."""
     sorted_df = df.sort("series_id")
     X = scaler.transform(sorted_df.select(feat_cols).to_numpy())
     rets = sorted_df["daily_return"].to_numpy()
@@ -246,8 +303,8 @@ def _df_to_tensors(df, feat_cols, scaler, series_ids, device):
 
 def prepare_datasets(device, seed=None):
     """
-    Generate training data only.
-    Returns dict with scaler, feat_cols, and per-series GPU tensors.
+    Generate training data using GPU-native pipeline.
+    Returns dict with per-series GPU tensors and normalization stats.
     """
     seed = seed if seed is not None else SEED
     np.random.seed(seed)
@@ -258,33 +315,24 @@ def prepare_datasets(device, seed=None):
     mt_weights = [0.60, 0.25, 0.15]
 
     print(f"  Generating {N_TRAIN_SERIES} train series (GPU, seed={seed})...")
-    prices_list, df_feat, mt_list, ar_list = _generate_series_block(
+    train_feats, train_rets, feat_mean, feat_std, _ = _generate_block_gpu(
         N_TRAIN_SERIES, N_TRAIN_DAYS, param_rng, seed, device,
         mt_choices, mt_weights)
-    print(f"  Done. {len(df_feat)} samples.")
-
-    feat_cols = [f"d_mm_min_{w}" for w in WINDOWS] + [f"d_mm_max_{w}" for w in WINDOWS]
-    print(f"  Fitting scaler...")
-    scaler = StandardScaler()
-    scaler.fit(df_feat.select(feat_cols).to_numpy())
-
-    print(f"  Uploading to GPU...")
-    train_ids = list(range(N_TRAIN_SERIES))
-    train_feats, train_rets = _df_to_tensors(
-        df_feat, feat_cols, scaler, train_ids, device)
+    print(f"  Done. {len(train_feats)} series, "
+          f"{sum(f.shape[0] for f in train_feats)} samples.")
 
     return {
-        "feat_cols":    feat_cols,
-        "scaler":       scaler,
         "train_feats":  train_feats,
         "train_rets":   train_rets,
+        "feat_mean":    feat_mean,
+        "feat_std":     feat_std,
     }
 
 
-def prepare_test_data(device, scaler, feat_cols):
+def prepare_test_data(device, feat_mean, feat_std):
     """
-    Generate test data using a pre-fitted scaler (rank 0 only).
-    Returns dict with prices_list and per-series GPU tensors.
+    Generate test data using GPU-native pipeline with pre-computed normalization.
+    Returns dict with prices_list (for plotting) and per-series GPU tensors.
     """
     np.random.seed(SEED)
     torch.manual_seed(SEED)
@@ -293,14 +341,11 @@ def prepare_test_data(device, scaler, feat_cols):
     mt_weights = [0.60, 0.25, 0.15]
 
     print(f"  Generating {N_TEST_SERIES} test series (GPU)...")
-    prices_list, df_feat, _, _ = _generate_series_block(
+    test_feats, test_rets, _, _, prices_list = _generate_block_gpu(
         N_TEST_SERIES, N_TEST_DAYS, param_rng, SEED, device,
-        mt_choices, mt_weights)
-    print(f"  Done. {len(df_feat)} samples.")
-
-    test_ids = list(range(N_TEST_SERIES))
-    test_feats, test_rets = _df_to_tensors(
-        df_feat, feat_cols, scaler, test_ids, device)
+        mt_choices, mt_weights, need_prices_list=True,
+        feat_mean=feat_mean, feat_std=feat_std)
+    print(f"  Done. {len(test_feats)} series.")
 
     return {
         "prices_list":  prices_list,

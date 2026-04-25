@@ -120,7 +120,7 @@ def main():
         save_model(raw_policy, os.path.join(OUTPUT_DIR, "policy.pt"))
 
         # generate test data now — only rank 0
-        test_data = prepare_test_data(device, data["scaler"], data["feat_cols"])
+        test_data = prepare_test_data(device, data["feat_mean"], data["feat_std"])
         plot_prices(test_data["prices_list"], output_dir=OUTPUT_DIR)
 
         results = run_backtest(raw_policy, test_data["test_feats"], test_data["test_rets"])
