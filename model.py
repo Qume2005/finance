@@ -61,7 +61,6 @@ class MiniKDALayer(nn.Module):
         self.W_v = nn.Linear(d_input, d_value, bias=False)
         self.pope_delta_raw = nn.Parameter(torch.zeros(d_key))
         d_alpha = int(d_key * 1.618)
-        self.alpha_gate = nn.Linear(d_input, d_alpha, bias=False)
         self.alpha_up   = nn.Linear(d_input, d_alpha, bias=False)
         self.alpha_down = nn.Linear(d_alpha, self.dk_pope, bias=False)
         self.post_norm = nn.RMSNorm(d_value)
@@ -100,8 +99,7 @@ class MiniKDALayer(nn.Module):
         q = self._apply_pope(F.normalize(self.W_q(x_seq), dim=-1), positions, is_query=True)
         k = self._apply_pope(F.normalize(self.W_k(x_seq), dim=-1), positions, is_query=False)
         v = F.silu(self.W_v(x_seq))
-        alpha = F.sigmoid(self.alpha_down(
-            F.silu(self.alpha_gate(x_seq)) * self.alpha_up(x_seq)))
+        alpha = F.sigmoid(self.alpha_down(F.silu(self.alpha_up(x_seq))))
         out = self._kda_recursion(q, k, v, alpha, T)
 
         out = self.post_norm(out)
