@@ -8,7 +8,7 @@ import torch.nn.functional as F
 
 def sinkhorn_knopp(M, n_iters=6):
     """Project (..., n, n) to doubly stochastic matrix."""
-    M = torch.exp(M)
+    M = torch.exp(torch.tanh(M))
     for _ in range(n_iters):
         M = M / M.sum(dim=-1, keepdim=True)
         M = M / M.sum(dim=-2, keepdim=True)
