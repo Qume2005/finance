@@ -6,9 +6,28 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.distributions import Categorical
+from torch.autograd import detect_anomaly
 
 from config import (SEED, EPISODE_LEN, G_SAMPLES, LAMBDA_DD,
                     EPS_CLIP, BETA_KL, N_EPISODES, LR, BATCH_SIZE)
+
+
+def attach_nan_hooks(model, tag=""):
+    """Register forward hooks that print NaN/Inf on every submodule output."""
+    handles = []
+    def make_hook(name):
+        def hook(mod, inp, out):
+            if isinstance(out, torch.Tensor):
+                has_nan = torch.isnan(out).any().item()
+                has_inf = torch.isinf(out).any().item()
+                if has_nan or has_inf:
+                    print(f"  [NaN]{tag} {name}  nan={has_nan} inf={has_inf}  "
+                          f"shape={tuple(out.shape)}")
+        return hook
+    for name, mod in model.named_modules():
+        if len(list(mod.children())) == 0:  # leaf modules only
+            handles.append(mod.register_forward_hook(make_hook(name)))
+    return handles
 
 
 def compute_rewards(positions, daily_returns, lam=LAMBDA_DD):
@@ -38,8 +57,18 @@ def train_grpo(policy, ref_policy, train_feats, train_rets,
     np.random.seed(SEED + rank)
     torch.manual_seed(SEED + rank)
 
-    optimizer = torch.optim.Adam(policy.parameters(), lr=LR)
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, N_EPISODES)
+    # Muon for 2D params, SGD for the rest (biases, norms, etc.)
+    muon_params, sgd_params = [], []
+    for p in policy.parameters():
+        (muon_params if p.dim() >= 2 else sgd_params).append(p)
+    optimizers = [
+        torch.optim.Muon(muon_params, lr=LR, momentum=0.618),
+        torch.optim.SGD(sgd_params, lr=LR, momentum=0.618, weight_decay=1e-2),
+    ]
+    schedulers = [
+        torch.optim.lr_scheduler.CosineAnnealingLR(opt, N_EPISODES)
+        for opt in optimizers
+    ]
 
     def sample_episode_batch():
         # Pre-allocate output tensors
@@ -54,11 +83,22 @@ def train_grpo(policy, ref_policy, train_feats, train_rets,
             r_batch[i] = train_rets[idx][start+1:start+EPISODE_LEN+1]
         return f_batch, r_batch
 
+    # ── NaN diagnosis: hooks on every leaf module ──
+    raw_model = policy.module if isinstance(policy, (nn.parallel.DistributedDataParallel,)) else policy
+    handles = attach_nan_hooks(raw_model, tag="[fwd]")
+
     def grpo_step():
         feats, rets = sample_episode_batch()            # (B, T, 14), (B, T)
 
-        # forward (with grad)
-        logits = policy(feats)                          # (B, T, 11)
+        # forward (with grad) + anomaly detection
+        with detect_anomaly():
+            logits = policy(feats)                          # (B, T, 11)
+
+        # quick check logits
+        if torch.isnan(logits).any() or torch.isinf(logits).any():
+            print(f"  [NaN] logits has nan={torch.isnan(logits).any().item()} "
+                  f"inf={torch.isinf(logits).any().item()}")
+
         log_probs = F.log_softmax(logits, dim=-1)
 
         with torch.no_grad():
@@ -92,11 +132,24 @@ def train_grpo(policy, ref_policy, train_feats, train_rets,
         kl = (ref_p * (ref_lp - log_probs)).sum(dim=-1).mean()
 
         loss = loss_clip + BETA_KL * kl
-        optimizer.zero_grad()
-        loss.backward()
+        for opt in optimizers:
+            opt.zero_grad()
+
+        # backward + anomaly detection
+        with detect_anomaly():
+            loss.backward()
+
+        # check grads for NaN
+        for name, p in raw_model.named_parameters():
+            if p.grad is not None and (torch.isnan(p.grad).any() or torch.isinf(p.grad).any()):
+                print(f"  [NaN] grad {name}  nan={torch.isnan(p.grad).any().item()} "
+                      f"inf={torch.isinf(p.grad).any().item()}")
+
         nn.utils.clip_grad_norm_(policy.parameters(), 1.0)
-        optimizer.step()
-        scheduler.step()
+        for opt in optimizers:
+            opt.step()
+        for sch in schedulers:
+            sch.step()
         return loss.item(), rw.mean().item(), rw.std().item()
 
     # ── Training loop ──
@@ -115,7 +168,7 @@ def train_grpo(policy, ref_policy, train_feats, train_rets,
             if ep % 50 == 0 or ep == 1:
                 elapsed = time.time() - t0
                 print(f"  Step {ep:4d}/{N_EPISODES}  loss={loss:+.4f}  "
-                      f"reward={rm:+.4f}±{rs:.4f}  lr={scheduler.get_last_lr()[0]:.2e}  "
+                      f"reward={rm:+.4f}±{rs:.4f}  lr={schedulers[0].get_last_lr()[0]:.2e}  "
                       f"[{elapsed:.0f}s]")
 
     if is_main:
