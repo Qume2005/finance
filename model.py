@@ -155,12 +155,17 @@ class KDAPolicyNetwork(nn.Module):
         self.mhc = nn.ModuleList([
             MHC(d_hidden, n_mhc) for _ in range(n_layers * 2)])
 
-        # AttnRes with pre W key projection
+        # AttnRes with per-layer stream projection (preH: n*d → d)
         self.attn_res_norm = nn.RMSNorm(d_hidden)
-        self.pre_w = nn.Linear(d_hidden, d_hidden, bias=False)
+        self.preH = nn.ModuleList([
+            nn.Linear(n_mhc * d_hidden, d_hidden, bias=False)
+            for _ in range(n_layers)])
+        # self.w = nn.ParameterList([
+        #     nn.Parameter(torch.zeros(d_hidden))
+        #     for _ in range(n_layers * 2 + 1)])
         self.w = nn.ParameterList([
             nn.Parameter(torch.zeros(d_hidden))
-            for _ in range(n_layers * 2 + 1)])
+            for _ in range(n_layers)])
 
         # Head
         d_head = int(d_hidden * 1.618)
@@ -180,16 +185,21 @@ class KDAPolicyNetwork(nn.Module):
             nn.init.normal_(layer.down.weight, std=scale * (2.0 / layer.down.in_features) ** 0.5)
         nn.init.normal_(self.head_down.weight,
                         std=scale * (2.0 / self.head_down.in_features) ** 0.5)
-        nn.init.normal_(self.pre_w.weight, std=scale)
+        for ph in self.preH:
+            nn.init.normal_(ph.weight, std=scale)
 
-    def _attn_res(self, acc, w_l):
-        """AttnRes aggregation — incremental softmax weighted sum."""
-        # Stack only for the attention computation
-        V = torch.stack(acc)                          # (L, B, T, d)
-        K = self.pre_w(self.attn_res_norm(V))         # (L, B, T, d)
+    def _attn_res(self, acc, w_l, pre_h):
+        """AttnRes: project streams (B,n,T,d)→(B,T,d), then softmax weighted sum."""
+        projected = []
+        for a in acc:
+            # a: (B, n, T, d) → (B, T, n*d) → pre_h → (B, T, d)
+            B, n, T, d = a.shape
+            projected.append(pre_h(a.permute(0, 2, 1, 3).reshape(B, T, n * d)))
+        V = torch.stack(projected)                        # (L, B, T, d)
+        K = self.attn_res_norm(V)                         # (L, B, T, d)
         logits = torch.einsum('d,lbtd->lbt', w_l, K)
-        alpha = logits.softmax(0)                     # (L, B, T)
-        return torch.einsum('lbt,lbtd->btd', alpha, V)
+        alpha = logits.softmax(0)                         # (L, B, T)
+        return torch.einsum('lbt,lbtd->btd', alpha, V)   # (B, T, d)
 
     def forward(self, x):
         squeeze = (x.dim() == 2)
@@ -203,29 +213,29 @@ class KDAPolicyNetwork(nn.Module):
         stream = torch.zeros(B, n, T, d, device=x.device)
         stream[:, 0] = v0
 
-        acc = [v0]
+        acc = [stream]
 
         for l in range(self.n_layers):
             # ── Attention ──
             H_res, H_pre, H_post = self.mhc[l * 2](stream)
-            stream = torch.einsum('btij,bjtd->bitd', H_res, stream)
+            res_stream = torch.einsum('btij,bjtd->bitd', H_res, stream)
             h = torch.einsum('btn,bntd->btd', H_pre, stream)
-            if len(acc) > 1:
-                h = h + self._attn_res(acc, self.w[l * 2])
+            # if len(acc) > 1:
+            #     h = h + self._attn_res(acc, self.w[l * 2])
             out = self.kda_layers[l](h)
-            stream = stream + torch.einsum('btn,btd->bntd', H_post, out)
-            acc.append(out)
+            stream = res_stream + torch.einsum('btn,btd->bntd', H_post, out)
+            # acc.append(out)
 
             # ── SwiGLU ──
             H_res, H_pre, H_post = self.mhc[l * 2 + 1](stream)
-            stream = torch.einsum('btij,bjtd->bitd', H_res, stream)
+            res_stream = torch.einsum('btij,bjtd->bitd', H_res, stream)
             h = torch.einsum('btn,bntd->btd', H_pre, stream)
-            h = h + self._attn_res(acc, self.w[l * 2 + 1])
             out = self.swiglu_layers[l](h)
-            stream = stream + torch.einsum('btn,btd->bntd', H_post, out)
-            acc.append(out)
+            stream = res_stream + torch.einsum('btn,btd->bntd', H_post, out)
+            stream = stream + self._attn_res(acc, self.w[l], self.preH[l]).unsqueeze(1)
+            acc.append(stream)
 
-        h_out = self._attn_res(acc, self.w[self.n_layers * 2])
+        h_out = self._attn_res(acc, self.w[-1], self.preH[-1])
         out = self.head_down(F.silu(self.head_gate(h_out)) * self.head_up(h_out))
         if squeeze:
             out = out.squeeze(0)
