@@ -33,7 +33,7 @@ class MHC(nn.Module):
         self.b_res  = nn.Parameter(torch.zeros(n, n))
         self.alpha_pre  = nn.Parameter(torch.tensor(0.01))
         self.alpha_post = nn.Parameter(torch.tensor(0.01))
-        self.alpha_res  = nn.Parameter(torch.tensor(0.01))
+        self.alpha_res = nn.Parameter(torch.tensor(0.01))
 
     def forward(self, stream):
         """stream: (B, n, T, d) → H_res(B,T,n,n), H_pre(B,T,n), H_post(B,T,n)"""
@@ -143,7 +143,7 @@ class KDAPolicyNetwork(nn.Module):
     Input : (T, 14)  MMn diff features
     Output: (T, 11)  logits for positions 0-10
     """
-    def __init__(self, d_input=14, d_hidden=32, n_actions=11, n_layers=8, n_mhc=4):
+    def __init__(self, d_input=14, d_hidden=32, n_actions=11, n_layers=4, n_mhc=4):
         super().__init__()
         self.n_layers = n_layers
         self.n_mhc = n_mhc

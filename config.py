@@ -25,7 +25,7 @@ EPS_CLIP    = 0.2
 BETA_KL     = 0.04
 N_EPISODES  = 5000
 LR          = 1e-3
-BATCH_SIZE  = 256
+BATCH_SIZE  = 512
 
 # Output
 OUTPUT_DIR = "output"

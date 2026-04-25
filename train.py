@@ -9,7 +9,7 @@ from torch.distributions import Categorical
 
 from config import (SEED, EPISODE_LEN, G_SAMPLES, LAMBDA_DD,
                     EPS_CLIP, BETA_KL, N_EPISODES, LR, BATCH_SIZE)
-from muon import Muon
+from muon import NewtonMuon
 
 
 def compute_rewards(positions, daily_returns, lam=LAMBDA_DD):
@@ -39,18 +39,21 @@ def train_grpo(policy, ref_policy, train_feats, train_rets,
     np.random.seed(SEED + rank)
     torch.manual_seed(SEED + rank)
 
-    # Muon for 2D params, SGD for the rest (biases, norms, etc.)
+    # NewtonMuon for 2D params, SGD for the rest (biases, norms, etc.)
     muon_params, sgd_params = [], []
     for p in policy.parameters():
         (muon_params if p.dim() >= 2 else sgd_params).append(p)
-    optimizers = [
-        Muon(muon_params, lr=LR, momentum=0.618, weight_decay=1e-2),
-        torch.optim.SGD(sgd_params, lr=LR, momentum=0.618, weight_decay=1e-2),
-    ]
+    muon_opt = NewtonMuon(muon_params, lr=LR, momentum=0.618, weight_decay=1e-2)
+    sgd_opt = torch.optim.SGD(sgd_params, lr=LR, momentum=0.618, weight_decay=1e-2)
+    optimizers = [muon_opt, sgd_opt]
     schedulers = [
         torch.optim.lr_scheduler.CosineAnnealingLR(opt, N_EPISODES)
         for opt in optimizers
     ]
+
+    # Register activation hooks on unwrapped model for Newton-Muon preconditioner
+    raw_model = policy.module if isinstance(policy, (nn.parallel.DistributedDataParallel,)) else policy
+    muon_opt.register_hooks(raw_model)
 
     def sample_episode_batch():
         # Pre-allocate output tensors
@@ -65,11 +68,19 @@ def train_grpo(policy, ref_policy, train_feats, train_rets,
             r_batch[i] = train_rets[idx][start+1:start+EPISODE_LEN+1]
         return f_batch, r_batch
 
+    _global_step = [0]  # mutable counter for Newton-Muon preconditioner refresh
+
     def grpo_step():
         feats, rets = sample_episode_batch()            # (B, T, 14), (B, T)
 
         # forward (with grad)
         logits = policy(feats)                          # (B, T, 11)
+
+        # Newton-Muon: refresh preconditioner periodically
+        _global_step[0] += 1
+        if _global_step[0] % muon_opt.refresh_interval == 0:
+            muon_opt.update_preconditioner()
+
         log_probs = F.log_softmax(logits, dim=-1)
 
         with torch.no_grad():
