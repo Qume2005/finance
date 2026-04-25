@@ -8,7 +8,7 @@ import torch.nn.functional as F
 
 def sinkhorn_knopp(M, n_iters=6):
     """Project (..., n, n) to doubly stochastic matrix."""
-    M = torch.exp(torch.tanh(M))
+    M = torch.exp(M)
     for _ in range(n_iters):
         M = M / M.sum(dim=-1, keepdim=True)
         M = M / M.sum(dim=-2, keepdim=True)
@@ -24,6 +24,7 @@ class MHC(nn.Module):
         super().__init__()
         self.n = n
         nd = n * d_hidden
+        self.norm = nn.RMSNorm(nd)
         self.phi_pre  = nn.Linear(nd, n, bias=False)
         self.phi_post = nn.Linear(nd, n, bias=False)
         self.phi_res  = nn.Linear(nd, n * n, bias=False)
@@ -37,8 +38,7 @@ class MHC(nn.Module):
     def forward(self, stream):
         """stream: (B, n, T, d) → H_res(B,T,n,n), H_pre(B,T,n), H_post(B,T,n)"""
         B, n, T, d = stream.shape
-        x = stream.permute(0, 2, 1, 3).reshape(B, T, n * d)
-        x = x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + 1e-8)
+        x = self.norm(stream.permute(0, 2, 1, 3).reshape(B, T, n * d))
 
         H_pre = torch.sigmoid(self.alpha_pre * self.phi_pre(x) + self.b_pre)
         H_post = 2 * torch.sigmoid(self.alpha_post * self.phi_post(x) + self.b_post)
