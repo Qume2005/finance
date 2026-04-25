@@ -49,7 +49,7 @@ class MHC(nn.Module):
 
 
 class MiniKDALayer(nn.Module):
-    """KDA delta attention with PoPE, SwiGLU alpha gate."""
+    """KDA delta attention with PoPE, SwiGLU alpha gate, beta gate."""
     def __init__(self, d_input, d_key=16, d_value=16):
         super().__init__()
         self.dk, self.dv = d_key, d_value
@@ -63,6 +63,9 @@ class MiniKDALayer(nn.Module):
         d_alpha = int(d_key * 1.618)
         self.alpha_up   = nn.Linear(d_input, d_alpha, bias=False)
         self.alpha_down = nn.Linear(d_alpha, self.dk_pope, bias=False)
+        # β gate: head-wise scalar ∈ [0,1], low-rank projection (Eq.8)
+        self.beta_up   = nn.Linear(d_input, d_alpha, bias=False)
+        self.beta_down = nn.Linear(d_alpha, 1, bias=False)
         self.post_norm = nn.RMSNorm(d_value)
         d_d = int(d_value / 1.618)
         self.W_d = nn.Linear(d_input, d_d, bias=False)
@@ -78,8 +81,11 @@ class MiniKDALayer(nn.Module):
         imag = mu * torch.sin(phi)
         return torch.cat([real, imag], dim=-1)
 
-    def _kda_recursion(self, q, k, v, alpha, T):
-        """Batched sequential KDA update."""
+    def _kda_recursion(self, q, k, v, alpha, beta, T):
+        """Batched sequential KDA update with beta gate.
+
+        S_t = (I - β_t * k_t k_t^T) * Diag(α_t) * S_{t-1} + β_t * k_t v_t^T
+        """
         B = q.shape[0]
         S = q.new_zeros(B, self.dk_pope, self.dv)
         out = q.new_empty(B, T, self.dv)
@@ -87,9 +93,10 @@ class MiniKDALayer(nn.Module):
             aS = alpha[:, t].unsqueeze(-1) * S                    # (B, dk_pope, dv)
             kt = k[:, t]                                            # (B, dk_pope)
             kt_aS = torch.einsum('bd,bde->be', kt, aS)            # (B, dv)
+            bt = beta[:, t].unsqueeze(-1)                           # (B, 1)
             S = (aS
-                 - torch.bmm(kt.unsqueeze(2), kt_aS.unsqueeze(1))
-                 + torch.bmm(kt.unsqueeze(2), v[:, t].unsqueeze(1)))
+                 - bt * torch.bmm(kt.unsqueeze(2), kt_aS.unsqueeze(1))
+                 + bt * torch.bmm(kt.unsqueeze(2), v[:, t].unsqueeze(1)))
             out[:, t] = torch.einsum('bd,bde->be', q[:, t], S)
         return out
 
@@ -100,7 +107,8 @@ class MiniKDALayer(nn.Module):
         k = self._apply_pope(F.normalize(self.W_k(x_seq), dim=-1), positions, is_query=False)
         v = F.silu(self.W_v(x_seq))
         alpha = F.sigmoid(self.alpha_down(F.silu(self.alpha_up(x_seq))))
-        out = self._kda_recursion(q, k, v, alpha, T)
+        beta = F.sigmoid(self.beta_down(F.silu(self.beta_up(x_seq))))   # (B, T, 1)
+        out = self._kda_recursion(q, k, v, alpha, beta, T)
 
         out = self.post_norm(out)
         out = out * torch.sigmoid(self.W_u(F.silu(self.W_d(x_seq))))

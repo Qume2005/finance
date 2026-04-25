@@ -19,13 +19,13 @@ TEST_IDS  = list(range(N_TRAIN_SERIES, N_SERIES))
 
 # GRPO
 EPISODE_LEN = 400
-G_SAMPLES   = 256
+G_SAMPLES   = 512
 LAMBDA_DD   = 2.0
 EPS_CLIP    = 0.2
 BETA_KL     = 0.04
 N_EPISODES  = 5000
 LR          = 1e-3
-BATCH_SIZE  = 256       # episodes per GRPO step (32GB 显卡甜点，按需调整)
+BATCH_SIZE  = 256
 
 # Output
 OUTPUT_DIR = "output"
