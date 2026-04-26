@@ -94,13 +94,14 @@ def train_grpo(policy, ref_policy, train_feats, train_rets,
         return f_batch, r_batch
 
     def sliding_forward(model, feats):
-        """Sliding window forward: EPISODE_LEN per window, cat results."""
+        """Sliding window forward, parallelized via batch reshape."""
         B, T, D = feats.shape
-        parts = []
-        for start in range(0, T, EPISODE_LEN):
-            end = min(start + EPISODE_LEN, T)
-            parts.append(model(feats[:, start:end]))
-        return torch.cat(parts, dim=1)
+        n_w = (T + EPISODE_LEN - 1) // EPISODE_LEN
+        pad = n_w * EPISODE_LEN - T
+        if pad:
+            feats = torch.cat([feats, feats.new_zeros(B, pad, D)], dim=1)
+        logits = model(feats.reshape(B * n_w, EPISODE_LEN, D))
+        return logits.reshape(B, n_w * EPISODE_LEN, -1)[:, :T, :]
 
     def grpo_step():
         feats, rets = sample_series_batch()          # (B, SEQ_LEN, 14), (B, SEQ_LEN)

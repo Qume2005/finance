@@ -16,18 +16,19 @@ from config import TEST_IDS, OUTPUT_DIR, EPISODE_LEN
 # ────────────────── Backtest ──────────────────
 
 def backtest_series(policy, feats, rets, label=""):
-    """Run backtest with sliding window to match training EPISODE_LEN."""
-    T = feats.shape[0] - 1  # 可决策的时间步
-    positions = torch.zeros(T, dtype=torch.long, device=feats.device)
+    """Run backtest with sliding window, parallelized via batch reshape."""
+    T = feats.shape[0] - 1                               # 可决策的时间步
+    D = feats.shape[1]
+    n_w = (T + EPISODE_LEN - 1) // EPISODE_LEN
+    pad = n_w * EPISODE_LEN - T
     with torch.no_grad():
-        # 滑动窗口：每次取 EPISODE_LEN 长度的片段，只取最后一个决策
-        for start in range(0, T, EPISODE_LEN):
-            end = min(start + EPISODE_LEN + 1, feats.shape[0])
-            window = feats[start:end]                    # (<=EPISODE_LEN+1, 14)
-            logits = policy(window)                      # (<=EPISODE_LEN+1, 11)
-            # 取窗口内对应的决策位（排除第一步，因为用 feats[t] 预测 position[t]）
-            n_decide = min(EPISODE_LEN, T - start)
-            positions[start:start + n_decide] = logits[:-1].argmax(dim=-1)[:n_decide]
+        f = feats[:T]                                    # (T, D)
+        if pad:
+            f = torch.cat([f, f.new_zeros(pad, D)], dim=0)
+        # (T, D) → (n_w * EPISODE_LEN, D) → (n_w, EPISODE_LEN, D)
+        batch = f.reshape(n_w, EPISODE_LEN, D)
+        logits = policy(batch).reshape(n_w * EPISODE_LEN, -1)[:T]
+        positions = logits.argmax(dim=-1)
 
     rets_f = rets[1:]                                 # GPU
     pos_w = positions.float() / 10.0                  # GPU
