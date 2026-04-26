@@ -11,7 +11,7 @@ from torch.distributions import Categorical
 
 from config import (SEED, EPISODE_LEN, G_SAMPLES, LAMBDA_DD,
                     EPS_CLIP, BETA_KL, N_EPISODES, LR, BATCH_SIZE,
-                    WEIGHT_DECAY, SAVE_EVERY, OUTPUT_DIR)
+                    WEIGHT_DECAY, SAVE_EVERY, OUTPUT_DIR, ENTROPY_COEFF)
 from muon import NewtonMuon
 
 
@@ -94,14 +94,23 @@ def train_grpo(policy, ref_policy, train_feats, train_rets,
         return f_batch, r_batch
 
     def sliding_forward(model, feats):
-        """Sliding window forward, parallelized via batch reshape."""
+        """Sliding window forward with KDA state carryover across windows."""
         B, T, D = feats.shape
         n_w = (T + EPISODE_LEN - 1) // EPISODE_LEN
         pad = n_w * EPISODE_LEN - T
         if pad:
             feats = torch.cat([feats, feats.new_zeros(B, pad, D)], dim=1)
-        logits = model(feats.reshape(B * n_w, EPISODE_LEN, D))
-        return logits.reshape(B, n_w * EPISODE_LEN, -1)[:, :T, :]
+
+        all_logits = []
+        kda_states = None
+        for w in range(n_w):
+            window = feats[:, w * EPISODE_LEN:(w + 1) * EPISODE_LEN, :]
+            logits, kda_states = model(window, kda_states=kda_states)
+            if model.training:
+                kda_states = [s.detach() for s in kda_states]
+            all_logits.append(logits)
+
+        return torch.cat(all_logits, dim=1)[:, :T, :]
 
     def grpo_step():
         feats, rets = sample_series_batch()          # (B, SEQ_LEN, 14), (B, SEQ_LEN)
@@ -141,7 +150,8 @@ def train_grpo(policy, ref_policy, train_feats, train_rets,
             ref_p  = ref_lp.exp()
         kl = (ref_p * (ref_lp - log_probs)).sum(dim=-1).mean()
 
-        loss = loss_clip + BETA_KL * kl
+        entropy = -(log_probs.exp() * log_probs).sum(dim=-1).mean()
+        loss = loss_clip + BETA_KL * kl - ENTROPY_COEFF * entropy
         for opt in optimizers:
             opt.zero_grad()
         loss.backward()

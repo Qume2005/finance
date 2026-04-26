@@ -25,9 +25,15 @@ def backtest_series(policy, feats, rets, label=""):
         f = feats[:T]                                    # (T, D)
         if pad:
             f = torch.cat([f, f.new_zeros(pad, D)], dim=0)
-        # (T, D) → (n_w * EPISODE_LEN, D) → (n_w, EPISODE_LEN, D)
-        batch = f.reshape(n_w, EPISODE_LEN, D)
-        logits = policy(batch).reshape(n_w * EPISODE_LEN, -1)[:T]
+
+        all_logits = []
+        kda_states = None
+        for w in range(n_w):
+            window = f[w * EPISODE_LEN:(w + 1) * EPISODE_LEN].unsqueeze(0)  # (1, EPISODE_LEN, D)
+            logits_w, kda_states = policy(window, kda_states=kda_states)
+            all_logits.append(logits_w.squeeze(0))
+
+        logits = torch.cat(all_logits, dim=0)[:T]
         positions = logits.argmax(dim=-1)
 
     rets_f = rets[1:]                                 # GPU

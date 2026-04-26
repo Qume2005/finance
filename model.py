@@ -81,13 +81,13 @@ class MiniKDALayer(nn.Module):
         imag = mu * torch.sin(phi)
         return torch.cat([real, imag], dim=-1)
 
-    def _kda_recursion(self, q, k, v, alpha, beta, T):
+    def _kda_recursion(self, q, k, v, alpha, beta, T, S_init=None):
         """Batched sequential KDA update with beta gate.
 
         S_t = (I - β_t * k_t k_t^T) * Diag(α_t) * S_{t-1} + β_t * k_t v_t^T
         """
         B = q.shape[0]
-        S = q.new_zeros(B, self.dk_pope, self.dv)
+        S = S_init if S_init is not None else q.new_zeros(B, self.dk_pope, self.dv)
         out = q.new_empty(B, T, self.dv)
         for t in range(T):
             aS = alpha[:, t].unsqueeze(-1) * S                    # (B, dk_pope, dv)
@@ -98,9 +98,9 @@ class MiniKDALayer(nn.Module):
                  - bt * torch.bmm(kt.unsqueeze(2), kt_aS.unsqueeze(1))
                  + bt * torch.bmm(kt.unsqueeze(2), v[:, t].unsqueeze(1)))
             out[:, t] = torch.einsum('bd,bde->be', q[:, t], S)
-        return out
+        return out, S
 
-    def forward(self, x_seq):
+    def forward(self, x_seq, S_init=None):
         B, T, d = x_seq.shape
         positions = torch.arange(T, device=x_seq.device)
         q = self._apply_pope(F.normalize(self.W_q(x_seq), dim=-1), positions, is_query=True)
@@ -108,11 +108,11 @@ class MiniKDALayer(nn.Module):
         v = F.silu(self.W_v(x_seq))
         alpha = F.sigmoid(self.alpha_down(F.silu(self.alpha_up(x_seq))))
         beta = F.sigmoid(self.beta_down(F.silu(self.beta_up(x_seq))))   # (B, T, 1)
-        out = self._kda_recursion(q, k, v, alpha, beta, T)
+        out, S_final = self._kda_recursion(q, k, v, alpha, beta, T, S_init=S_init)
 
         out = self.post_norm(out)
         out = out * torch.sigmoid(self.W_u(F.silu(self.W_d(x_seq))))
-        return self.W_out(out)
+        return self.W_out(out), S_final
 
 
 class SwiGLU(nn.Module):
@@ -211,7 +211,7 @@ class KDAPolicyNetwork(nn.Module):
         alpha = logits.softmax(0)                         # (L, B, T)
         return torch.einsum('lbt,lbtd->btd', alpha, V)   # (B, T, d)
 
-    def forward(self, x):
+    def forward(self, x, kda_states=None):
         squeeze = (x.dim() == 2)
         if squeeze:
             x = x.unsqueeze(0)
@@ -219,11 +219,15 @@ class KDAPolicyNetwork(nn.Module):
         n = self.n_mhc
         d = self.d
 
+        if kda_states is None:
+            kda_states = [None] * self.n_layers
+
         v0 = self.inp_proj(x)                           # (B, T, d)
         stream = torch.zeros(B, n, T, d, device=x.device)
         stream[:, 0] = v0
 
         acc = [stream]
+        new_states = []
 
         for l in range(self.n_layers):
             # ── Attention ──
@@ -231,8 +235,9 @@ class KDAPolicyNetwork(nn.Module):
             H_res, H_pre, H_post = self.mhc[l * 2](stream)
             res_stream = torch.einsum('btij,bjtd->bitd', H_res, stream)
             h = torch.einsum('btn,bntd->btd', H_pre, stream)
-            out = self.kda_layers[l](h)
-            stream = res_stream + torch.einsum('btn,btd->bntd', H_post, out)
+            kda_out, S_final = self.kda_layers[l](h, S_init=kda_states[l])
+            new_states.append(S_final)
+            stream = res_stream + torch.einsum('btn,btd->bntd', H_post, kda_out)
 
             # ── SwiGLU ──
             stream = self.stream_norms[l * 2 + 1](stream)
@@ -248,4 +253,4 @@ class KDAPolicyNetwork(nn.Module):
         out = self.head_down(F.silu(self.head_gate(h_out)) * self.head_up(h_out))
         if squeeze:
             out = out.squeeze(0)
-        return out
+        return out, new_states
