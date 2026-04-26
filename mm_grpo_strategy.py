@@ -67,6 +67,8 @@ def create_models(device, is_main, world_size, local_rank):
     if world_size == 1:
         policy = torch.compile(raw_policy)
         ref_policy = torch.compile(ref_policy)
+    else:
+        policy = raw_policy
 
     if is_main:
         n_params = sum(p.numel() for p in raw_policy.parameters())
