@@ -20,15 +20,24 @@ def compute_rewards(positions, daily_returns, lam=LAMBDA_DD):
     positions:      (G, T) or (G, B, T) LongTensor 0-10
     daily_returns:  (T,)   or (B, T)  FloatTensor
     returns:        (G,)   or (G, B)  reward per trajectory
+
+    reward = (1-λ)(strat_return - bh_return) + λ(strat_maxdd - bh_maxdd)
     """
     w = positions.float() / 10.0
     pnl = w * daily_returns.unsqueeze(0)
     equity = torch.cumprod(1.0 + pnl, dim=-1)
+    # Strategy
+    strat_return = equity[..., -1]
     peak = torch.cummax(equity, dim=-1).values
     dd = (peak - equity) / (peak + 1e-8)
-    max_dd = dd.max(dim=-1).values
-    log_ret = torch.log(equity[..., -1] + 1e-8)
-    return log_ret - lam * max_dd
+    strat_maxdd = dd.max(dim=-1).values
+    # Buy & Hold
+    bh_equity = torch.cumprod(1.0 + daily_returns, dim=-1)
+    bh_return = bh_equity[..., -1]
+    bh_peak = torch.cummax(bh_equity, dim=-1).values
+    bh_dd = (bh_peak - bh_equity) / (bh_peak + 1e-8)
+    bh_maxdd = bh_dd.max(dim=-1).values
+    return (1 - lam) * (strat_return - bh_return) + lam * (strat_maxdd - bh_maxdd)
 
 
 def train_grpo(policy, ref_policy, train_feats, train_rets,
