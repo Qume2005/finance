@@ -1,5 +1,6 @@
 """GRPO training loop."""
 
+import os
 import time
 import numpy as np
 import torch
@@ -9,7 +10,7 @@ from torch.distributions import Categorical
 
 from config import (SEED, EPISODE_LEN, G_SAMPLES, LAMBDA_DD,
                     EPS_CLIP, BETA_KL, N_EPISODES, LR, BATCH_SIZE,
-                    WEIGHT_DECAY)
+                    WEIGHT_DECAY, SAVE_EVERY, OUTPUT_DIR)
 from muon import NewtonMuon
 
 
@@ -127,6 +128,7 @@ def train_grpo(policy, ref_policy, train_feats, train_rets,
 
     # ── Training loop ──
     if is_main:
+        os.makedirs(OUTPUT_DIR, exist_ok=True)
         print(f"\nTraining {N_EPISODES} steps × {BATCH_SIZE} ep/step  "
               f"(G={G_SAMPLES}, T={EPISODE_LEN}, world_size={world_size})")
     history = {"loss": [], "reward_mean": [], "reward_std": []}
@@ -143,6 +145,16 @@ def train_grpo(policy, ref_policy, train_feats, train_rets,
                 print(f"  Step {ep:4d}/{N_EPISODES}  loss={loss:+.4f}  "
                       f"reward={rm:+.4f}±{rs:.4f}  lr={schedulers[0].get_last_lr()[0]:.2e}  "
                       f"[{elapsed:.0f}s]")
+            if SAVE_EVERY and ep % SAVE_EVERY == 0:
+                ckpt_path = os.path.join(OUTPUT_DIR, f"ckpt_{ep}.pt")
+                torch.save({
+                    "step": ep,
+                    "model": raw_model.state_dict(),
+                    "muon_opt": muon_opt.state_dict(),
+                    "sgd_opt": sgd_opt.state_dict(),
+                    "history": history,
+                }, ckpt_path)
+                print(f"  Checkpoint saved → {ckpt_path}")
 
     if is_main:
         print(f"Training done in {time.time()-t0:.1f}s")
