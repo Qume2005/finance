@@ -42,7 +42,7 @@ def compute_rewards(positions, daily_returns, bh_return, bh_maxdd, lam=LAMBDA_DD
     peak = torch.cummax(equity, dim=-1).values
     dd = (peak - equity) / (peak + 1e-8)
     strat_maxdd = dd.max(dim=-1).values
-    return (1 - lam) * (strat_return - bh_return) + lam * (strat_maxdd - bh_maxdd)
+    return (1 - lam) * (strat_return - bh_return) - lam * (strat_maxdd - bh_maxdd)
 
 
 def train_grpo(policy, ref_policy, train_feats, train_rets,
