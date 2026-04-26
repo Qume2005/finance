@@ -144,13 +144,14 @@ def train_grpo(policy, ref_policy, train_feats, train_rets,
 
         # sliding window forward (with grad + optional AMP)
         with torch.autocast("cuda", enabled=USE_AMP):
-            logits = sliding_forward(policy, feats)       # (B, SEQ_LEN, 11)
-            log_probs = F.log_softmax(logits, dim=-1)
+            logits = sliding_forward(policy, feats)             # (B, SEQ_LEN, 11)
+
+        # float32 log_softmax — avoids -inf in fp16 causing zero-prob Categorical
+        log_probs = F.log_softmax(logits.float(), dim=-1)
 
         with torch.no_grad():
             old_log_probs = log_probs.detach()
-            old_probs = old_log_probs.exp()
-            dist_cat = Categorical(old_probs)                   # (B, SEQ_LEN, 11)
+            dist_cat = Categorical(logits=old_log_probs)        # (B, SEQ_LEN, 11)
             actions = dist_cat.sample((G_SAMPLES,))             # (G, B, SEQ_LEN)
             old_lp = old_log_probs.unsqueeze(0).expand(G_SAMPLES, -1, -1, -1) \
                                 .gather(3, actions.unsqueeze(3)).squeeze(3)
@@ -169,7 +170,8 @@ def train_grpo(policy, ref_policy, train_feats, train_rets,
         # KL(π_ref || π_θ) — 同样滑动窗口
         with torch.no_grad():
             with torch.autocast("cuda", enabled=USE_AMP):
-                ref_lp = F.log_softmax(sliding_forward(ref_policy, feats), dim=-1)
+                ref_logits = sliding_forward(ref_policy, feats)
+            ref_lp = F.log_softmax(ref_logits.float(), dim=-1)
             ref_p  = ref_lp.exp()
         kl = (ref_p * (ref_lp - log_probs)).sum(dim=-1).mean()
 
