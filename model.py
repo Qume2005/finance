@@ -48,6 +48,19 @@ class MHC(nn.Module):
         return H_res, H_pre, H_post
 
 
+@torch.compile
+def _kda_step(q_t, k_t, v_t, alpha_t, beta_t, S):
+    """Single KDA recursion step — compiled as a small graph."""
+    aS = alpha_t.unsqueeze(-1) * S
+    kt_aS = torch.einsum('bd,bde->be', k_t, aS)
+    bt = beta_t.unsqueeze(-1)
+    S = (aS
+         - bt * torch.bmm(k_t.unsqueeze(2), kt_aS.unsqueeze(1))
+         + bt * torch.bmm(k_t.unsqueeze(2), v_t.unsqueeze(1)))
+    out_t = torch.einsum('bd,bde->be', q_t, S)
+    return out_t, S
+
+
 class MiniKDALayer(nn.Module):
     """KDA delta attention with PoPE, SwiGLU alpha gate, beta gate."""
     def __init__(self, d_input, d_key=16, d_value=16):
@@ -81,23 +94,15 @@ class MiniKDALayer(nn.Module):
         imag = mu * torch.sin(phi)
         return torch.cat([real, imag], dim=-1)
 
+    @torch.compiler.disable
     def _kda_recursion(self, q, k, v, alpha, beta, T, S_init=None):
-        """Batched sequential KDA update with beta gate.
-
-        S_t = (I - β_t * k_t k_t^T) * Diag(α_t) * S_{t-1} + β_t * k_t v_t^T
-        """
+        """Sequential KDA update — loop disabled from compile, body compiled."""
         B = q.shape[0]
         S = S_init if S_init is not None else q.new_zeros(B, self.dk_pope, self.dv)
         out = q.new_empty(B, T, self.dv)
         for t in range(T):
-            aS = alpha[:, t].unsqueeze(-1) * S                    # (B, dk_pope, dv)
-            kt = k[:, t]                                            # (B, dk_pope)
-            kt_aS = torch.einsum('bd,bde->be', kt, aS)            # (B, dv)
-            bt = beta[:, t].unsqueeze(-1)                           # (B, 1)
-            S = (aS
-                 - bt * torch.bmm(kt.unsqueeze(2), kt_aS.unsqueeze(1))
-                 + bt * torch.bmm(kt.unsqueeze(2), v[:, t].unsqueeze(1)))
-            out[:, t] = torch.einsum('bd,bde->be', q[:, t], S)
+            out[:, t], S = _kda_step(q[:, t], k[:, t], v[:, t],
+                                     alpha[:, t], beta[:, t], S)
         return out, S
 
     def forward(self, x_seq, S_init=None):

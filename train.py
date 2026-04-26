@@ -11,14 +11,27 @@ from torch.distributions import Categorical
 
 from config import (SEED, EPISODE_LEN, G_SAMPLES, LAMBDA_DD,
                     EPS_CLIP, BETA_KL, N_EPISODES, LR, BATCH_SIZE,
-                    WEIGHT_DECAY, SAVE_EVERY, OUTPUT_DIR, ENTROPY_COEFF)
+                    WEIGHT_DECAY, SAVE_EVERY, OUTPUT_DIR, ENTROPY_COEFF,
+                    USE_AMP)
 from muon import NewtonMuon
 
 
-def compute_rewards(positions, daily_returns, lam=LAMBDA_DD):
+def compute_bh_metrics(daily_returns):
+    """Pre-compute Buy & Hold return and max drawdown (same across all G samples)."""
+    bh_equity = torch.cumprod(1.0 + daily_returns, dim=-1)
+    bh_return = bh_equity[..., -1]
+    bh_peak = torch.cummax(bh_equity, dim=-1).values
+    bh_dd = (bh_peak - bh_equity) / (bh_peak + 1e-8)
+    bh_maxdd = bh_dd.max(dim=-1).values
+    return bh_return, bh_maxdd
+
+
+def compute_rewards(positions, daily_returns, bh_return, bh_maxdd, lam=LAMBDA_DD):
     """
     positions:      (G, T) or (G, B, T) LongTensor 0-10
     daily_returns:  (T,)   or (B, T)  FloatTensor
+    bh_return:      scalar or (B,)    — pre-computed
+    bh_maxdd:       scalar or (B,)    — pre-computed
     returns:        (G,)   or (G, B)  reward per trajectory
 
     reward = (1-λ)(strat_return - bh_return) + λ(strat_maxdd - bh_maxdd)
@@ -26,17 +39,10 @@ def compute_rewards(positions, daily_returns, lam=LAMBDA_DD):
     w = positions.float() / 10.0
     pnl = w * daily_returns.unsqueeze(0)
     equity = torch.cumprod(1.0 + pnl, dim=-1)
-    # Strategy
     strat_return = equity[..., -1]
     peak = torch.cummax(equity, dim=-1).values
     dd = (peak - equity) / (peak + 1e-8)
     strat_maxdd = dd.max(dim=-1).values
-    # Buy & Hold
-    bh_equity = torch.cumprod(1.0 + daily_returns, dim=-1)
-    bh_return = bh_equity[..., -1]
-    bh_peak = torch.cummax(bh_equity, dim=-1).values
-    bh_dd = (bh_peak - bh_equity) / (bh_peak + 1e-8)
-    bh_maxdd = bh_dd.max(dim=-1).values
     return (1 - lam) * (strat_return - bh_return) + lam * (strat_maxdd - bh_maxdd)
 
 
@@ -93,13 +99,10 @@ def train_grpo(policy, ref_policy, train_feats, train_rets,
         """Sample full training series (feats[:-1] → rets[1:] alignment)."""
         T = train_feats[0].shape[0]
         seq_len = T - 1
-        f_batch = torch.empty(BATCH_SIZE, seq_len, train_feats[0].shape[1],
-                              device=train_feats[0].device)
-        r_batch = torch.empty(BATCH_SIZE, seq_len, device=train_rets[0].device)
-        for i in range(BATCH_SIZE):
-            idx = torch.randint(len(train_feats), (1,)).item()
-            f_batch[i] = train_feats[idx][:seq_len]
-            r_batch[i] = train_rets[idx][1:T]
+        n_series = len(train_feats)
+        indices = torch.randint(n_series, (BATCH_SIZE,))
+        f_batch = torch.stack([train_feats[idx.item()][:seq_len] for idx in indices])
+        r_batch = torch.stack([train_rets[idx.item()][1:T] for idx in indices])
         return f_batch, r_batch
 
     def sliding_forward(model, feats):
@@ -123,16 +126,19 @@ def train_grpo(policy, ref_policy, train_feats, train_rets,
 
     def grpo_step():
         feats, rets = sample_series_batch()          # (B, SEQ_LEN, 14), (B, SEQ_LEN)
-        seq_len = feats.shape[1]
 
         # Newton-Muon: refresh preconditioner periodically
         _global_step[0] += 1
         if _global_step[0] % muon_opt.refresh_interval == 0:
             muon_opt.update_preconditioner()
 
-        # sliding window forward (with grad)
-        logits = sliding_forward(policy, feats)       # (B, SEQ_LEN, 11)
-        log_probs = F.log_softmax(logits, dim=-1)
+        # Pre-compute BH metrics once (same for all G samples)
+        bh_return, bh_maxdd = compute_bh_metrics(rets)
+
+        # sliding window forward (with grad + optional AMP)
+        with torch.autocast("cuda", enabled=USE_AMP):
+            logits = sliding_forward(policy, feats)       # (B, SEQ_LEN, 11)
+            log_probs = F.log_softmax(logits, dim=-1)
 
         with torch.no_grad():
             old_log_probs = log_probs.detach()
@@ -141,9 +147,9 @@ def train_grpo(policy, ref_policy, train_feats, train_rets,
             actions = dist_cat.sample((G_SAMPLES,))             # (G, B, SEQ_LEN)
             old_lp = old_log_probs.unsqueeze(0).expand(G_SAMPLES, -1, -1, -1) \
                                 .gather(3, actions.unsqueeze(3)).squeeze(3)
-            rw = compute_rewards(actions, rets)                 # (G, B)
+            rw = compute_rewards(actions, rets, bh_return, bh_maxdd)
 
-        adv = ((rw - rw.mean(0)) / (rw.std(0) + 1e-8)).detach()
+        adv = rw.detach()
 
         cur_lp = log_probs.unsqueeze(0).expand(G_SAMPLES, -1, -1, -1) \
                           .gather(3, actions.unsqueeze(3)).squeeze(3)
@@ -155,7 +161,8 @@ def train_grpo(policy, ref_policy, train_feats, train_rets,
 
         # KL(π_ref || π_θ) — 同样滑动窗口
         with torch.no_grad():
-            ref_lp = F.log_softmax(sliding_forward(ref_policy, feats), dim=-1)
+            with torch.autocast("cuda", enabled=USE_AMP):
+                ref_lp = F.log_softmax(sliding_forward(ref_policy, feats), dim=-1)
             ref_p  = ref_lp.exp()
         kl = (ref_p * (ref_lp - log_probs)).sum(dim=-1).mean()
 

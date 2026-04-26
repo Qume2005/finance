@@ -23,6 +23,7 @@ LAMBDA_DD   = 2.0
 EPS_CLIP    = 0.2
 BETA_KL     = 0.04
 ENTROPY_COEFF = 0.01
+USE_AMP      = True
 N_EPISODES  = 5000
 SAVE_EVERY  = 500
 LR          = 1

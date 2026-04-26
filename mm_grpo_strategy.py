@@ -64,11 +64,15 @@ def create_models(device, is_main, world_size, local_rank):
 
     raw_policy = policy  # keep uncompiled reference for evaluation
 
+    # torch.compile: fuse KDA recursion + Sinkhorn + AttnRes into optimized kernels
+    policy = torch.compile(policy)
+    ref_policy = torch.compile(ref_policy)
+
     if is_main:
-        n_params = sum(p.numel() for p in policy.parameters())
+        n_params = sum(p.numel() for p in raw_policy.parameters())
         print(f"Parameters: {n_params:,}")
 
-    # DDP: gradient all-reduce across GPUs
+    # DDP: gradient all-reduce across GPUs (compile first, then wrap)
     if world_size > 1:
         policy = DDP(policy, device_ids=[local_rank])
 
