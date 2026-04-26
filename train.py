@@ -1,6 +1,7 @@
 """GRPO training loop."""
 
 import os
+import glob
 import time
 import numpy as np
 import torch
@@ -57,6 +58,28 @@ def train_grpo(policy, ref_policy, train_feats, train_rets,
     raw_model = policy.module if isinstance(policy, (nn.parallel.DistributedDataParallel,)) else policy
     muon_opt.register_hooks(raw_model)
 
+    _global_step = [0]  # mutable counter for Newton-Muon preconditioner refresh
+
+    # ── Resume from checkpoint ──
+    start_ep = 1
+    history = {"loss": [], "reward_mean": [], "reward_std": []}
+    ckpt_files = sorted(glob.glob(os.path.join(OUTPUT_DIR, "ckpt_*.pt")))
+    if ckpt_files:
+        ckpt_path = ckpt_files[-1]
+        ckpt = torch.load(ckpt_path, map_location="cpu", weights_only=False)
+        raw_model.load_state_dict(ckpt["model"])
+        muon_opt.load_state_dict(ckpt["muon_opt"])
+        sgd_opt.load_state_dict(ckpt["sgd_opt"])
+        start_ep = ckpt["step"] + 1
+        _global_step[0] = start_ep
+        history = ckpt.get("history", history)
+        if is_main:
+            print(f"Resumed from {ckpt_path} (step {ckpt['step']})")
+        # fast-forward schedulers to correct lr
+        for _ in range(ckpt["step"]):
+            for sch in schedulers:
+                sch.step()
+
     def sample_episode_batch():
         # Pre-allocate output tensors
         f_batch = torch.empty(BATCH_SIZE, EPISODE_LEN, train_feats[0].shape[1],
@@ -69,8 +92,6 @@ def train_grpo(policy, ref_policy, train_feats, train_rets,
             f_batch[i] = train_feats[idx][start:start+EPISODE_LEN]
             r_batch[i] = train_rets[idx][start+1:start+EPISODE_LEN+1]
         return f_batch, r_batch
-
-    _global_step = [0]  # mutable counter for Newton-Muon preconditioner refresh
 
     def grpo_step():
         feats, rets = sample_episode_batch()            # (B, T, 14), (B, T)
@@ -130,11 +151,11 @@ def train_grpo(policy, ref_policy, train_feats, train_rets,
     if is_main:
         os.makedirs(OUTPUT_DIR, exist_ok=True)
         print(f"\nTraining {N_EPISODES} steps × {BATCH_SIZE} ep/step  "
-              f"(G={G_SAMPLES}, T={EPISODE_LEN}, world_size={world_size})")
-    history = {"loss": [], "reward_mean": [], "reward_std": []}
+              f"(G={G_SAMPLES}, T={EPISODE_LEN}, world_size={world_size})"
+              + (f"  [resume from step {start_ep-1}]" if start_ep > 1 else ""))
     t0 = time.time()
 
-    for ep in range(1, N_EPISODES + 1):
+    for ep in range(start_ep, N_EPISODES + 1):
         loss, rm, rs = grpo_step()
         if is_main:
             history["loss"].append(loss)
@@ -146,6 +167,9 @@ def train_grpo(policy, ref_policy, train_feats, train_rets,
                       f"reward={rm:+.4f}±{rs:.4f}  lr={schedulers[0].get_last_lr()[0]:.2e}  "
                       f"[{elapsed:.0f}s]")
             if SAVE_EVERY and ep % SAVE_EVERY == 0:
+                # 删旧留新，只保留一个 checkpoint
+                for old in glob.glob(os.path.join(OUTPUT_DIR, "ckpt_*.pt")):
+                    os.remove(old)
                 ckpt_path = os.path.join(OUTPUT_DIR, f"ckpt_{ep}.pt")
                 torch.save({
                     "step": ep,
