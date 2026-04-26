@@ -47,7 +47,7 @@ def compute_rewards(positions, daily_returns, bh_return, bh_maxdd, lam=LAMBDA_DD
 
 
 def train_grpo(policy, ref_policy, train_feats, train_rets,
-               rank, world_size, is_main):
+               rank, world_size, is_main, raw_model=None):
     """
     Run GRPO training loop.
 
@@ -69,9 +69,9 @@ def train_grpo(policy, ref_policy, train_feats, train_rets,
         for opt in optimizers
     ]
 
-    # Register activation hooks on unwrapped model for Newton-Muon preconditioner
-    raw_model = policy.module if isinstance(policy, (nn.parallel.DistributedDataParallel,)) else policy
-    muon_opt.register_hooks(raw_model)
+    # Uncompiled model for Newton-Muon ZZ^T collection (hooks must NOT stay on during compiled forward)
+    if raw_model is None:
+        raw_model = policy.module if isinstance(policy, (nn.parallel.DistributedDataParallel,)) else policy
 
     _global_step = [0]  # mutable counter for Newton-Muon preconditioner refresh
 
@@ -130,6 +130,13 @@ def train_grpo(policy, ref_policy, train_feats, train_rets,
         # Newton-Muon: refresh preconditioner periodically
         _global_step[0] += 1
         if _global_step[0] % muon_opt.refresh_interval == 0:
+            # Temporarily register hooks → eager forward → collect ZZ^T → remove hooks
+            muon_opt.register_hooks(raw_model)
+            with torch.no_grad():
+                raw_model(feats[:, :EPISODE_LEN, :])
+            for h in muon_opt._hooks:
+                h.remove()
+            muon_opt._hooks = []
             muon_opt.update_preconditioner()
 
         # Pre-compute BH metrics once (same for all G samples)

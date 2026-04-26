@@ -203,6 +203,7 @@ class KDAPolicyNetwork(nn.Module):
         for ph in self.preH:
             nn.init.normal_(ph.weight, std=scale)
 
+    @torch.compiler.disable
     def _attn_res(self, acc, w_l, pre_h):
         """AttnRes: project streams (B,n,T,d)→(B,T,d), then softmax weighted sum."""
         projected = []
