@@ -62,10 +62,11 @@ def create_models(device, is_main, world_size, local_rank):
     for p in ref_policy.parameters():
         p.requires_grad = False
 
-    # Compile: KDA loop body already @torch.compile; _kda_recursion and _attn_res
-    # are @torch.compiler.disable; everything else gets fused by torch.compile
-    policy = torch.compile(raw_policy)
-    ref_policy = torch.compile(ref_policy)
+    # torch.compile: only single-GPU (DDP + compile has in-place tensor version conflicts)
+    # _kda_step is always compiled regardless (module-level @torch.compile)
+    if world_size == 1:
+        policy = torch.compile(raw_policy)
+        ref_policy = torch.compile(ref_policy)
 
     if is_main:
         n_params = sum(p.numel() for p in raw_policy.parameters())

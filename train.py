@@ -194,30 +194,45 @@ def train_grpo(policy, ref_policy, train_feats, train_rets,
               + (f"  [resume from step {start_ep-1}]" if start_ep > 1 else ""))
     t0 = time.time()
 
-    for ep in range(start_ep, N_EPISODES + 1):
-        loss, rm, rs = grpo_step()
+    try:
+        for ep in range(start_ep, N_EPISODES + 1):
+            loss, rm, rs = grpo_step()
+            if is_main:
+                history["loss"].append(loss)
+                history["reward_mean"].append(rm)
+                history["reward_std"].append(rs)
+                if ep % 50 == 0 or ep == 1:
+                    elapsed = time.time() - t0
+                    print(f"  Step {ep:4d}/{N_EPISODES}  loss={loss:+.4f}  "
+                          f"reward={rm:+.4f}±{rs:.4f}  lr={schedulers[0].get_last_lr()[0]:.2e}  "
+                          f"[{elapsed:.0f}s]")
+                if SAVE_EVERY and ep % SAVE_EVERY == 0:
+                    # 删旧留新，只保留一个 checkpoint
+                    for old in glob.glob(os.path.join(OUTPUT_DIR, "ckpt_*.pt")):
+                        os.remove(old)
+                    ckpt_path = os.path.join(OUTPUT_DIR, f"ckpt_{ep}.pt")
+                    torch.save({
+                        "step": ep,
+                        "model": raw_model.state_dict(),
+                        "muon_opt": muon_opt.state_dict(),
+                        "sgd_opt": sgd_opt.state_dict(),
+                        "history": history,
+                    }, ckpt_path)
+                    print(f"  Checkpoint saved → {ckpt_path}")
+    except KeyboardInterrupt:
         if is_main:
-            history["loss"].append(loss)
-            history["reward_mean"].append(rm)
-            history["reward_std"].append(rs)
-            if ep % 50 == 0 or ep == 1:
-                elapsed = time.time() - t0
-                print(f"  Step {ep:4d}/{N_EPISODES}  loss={loss:+.4f}  "
-                      f"reward={rm:+.4f}±{rs:.4f}  lr={schedulers[0].get_last_lr()[0]:.2e}  "
-                      f"[{elapsed:.0f}s]")
-            if SAVE_EVERY and ep % SAVE_EVERY == 0:
-                # 删旧留新，只保留一个 checkpoint
-                for old in glob.glob(os.path.join(OUTPUT_DIR, "ckpt_*.pt")):
-                    os.remove(old)
-                ckpt_path = os.path.join(OUTPUT_DIR, f"ckpt_{ep}.pt")
-                torch.save({
-                    "step": ep,
-                    "model": raw_model.state_dict(),
-                    "muon_opt": muon_opt.state_dict(),
-                    "sgd_opt": sgd_opt.state_dict(),
-                    "history": history,
-                }, ckpt_path)
-                print(f"  Checkpoint saved → {ckpt_path}")
+            last_ep = ep if 'ep' in dir() else start_ep
+            for old in glob.glob(os.path.join(OUTPUT_DIR, "ckpt_*.pt")):
+                os.remove(old)
+            ckpt_path = os.path.join(OUTPUT_DIR, f"ckpt_{last_ep}.pt")
+            torch.save({
+                "step": last_ep,
+                "model": raw_model.state_dict(),
+                "muon_opt": muon_opt.state_dict(),
+                "sgd_opt": sgd_opt.state_dict(),
+                "history": history,
+            }, ckpt_path)
+            print(f"\n  Interrupted at step {last_ep}. Checkpoint saved → {ckpt_path}")
 
     if is_main:
         print(f"Training done in {time.time()-t0:.1f}s")
