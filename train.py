@@ -11,8 +11,7 @@ from torch.distributions import Categorical
 
 from config import (SEED, EPISODE_LEN, G_SAMPLES, LAMBDA_DD,
                     EPS_CLIP, BETA_KL, N_EPISODES, LR, BATCH_SIZE,
-                    WEIGHT_DECAY, SAVE_EVERY, OUTPUT_DIR, ENTROPY_COEFF,
-                    USE_AMP)
+                    WEIGHT_DECAY, SAVE_EVERY, OUTPUT_DIR, ENTROPY_COEFF)
 from muon import NewtonMuon
 
 
@@ -142,9 +141,8 @@ def train_grpo(policy, ref_policy, train_feats, train_rets,
         # Pre-compute BH metrics once (same for all G samples)
         bh_return, bh_maxdd = compute_bh_metrics(rets)
 
-        # sliding window forward (with grad + optional AMP)
-        with torch.autocast("cuda", enabled=USE_AMP):
-            logits = sliding_forward(policy, feats)             # (B, SEQ_LEN, 11)
+        # sliding window forward
+        logits = sliding_forward(policy, feats)                 # (B, SEQ_LEN, 11)
 
         # float32 log_softmax — avoids -inf in fp16 causing zero-prob Categorical
         log_probs = F.log_softmax(logits.float(), dim=-1)
@@ -169,8 +167,7 @@ def train_grpo(policy, ref_policy, train_feats, train_rets,
 
         # KL(π_ref || π_θ) — 同样滑动窗口
         with torch.no_grad():
-            with torch.autocast("cuda", enabled=USE_AMP):
-                ref_logits = sliding_forward(ref_policy, feats)
+            ref_logits = sliding_forward(ref_policy, feats)
             ref_lp = F.log_softmax(ref_logits.float(), dim=-1)
             ref_p  = ref_lp.exp()
         kl = (ref_p * (ref_lp - log_probs)).sum(dim=-1).mean()
