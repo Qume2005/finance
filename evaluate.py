@@ -10,16 +10,24 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
-from config import TEST_IDS, OUTPUT_DIR
+from config import TEST_IDS, OUTPUT_DIR, EPISODE_LEN
 
 
 # ────────────────── Backtest ──────────────────
 
 def backtest_series(policy, feats, rets, label=""):
-    """Run backtest — all computation on GPU, numpy only for plotting output."""
+    """Run backtest with sliding window to match training EPISODE_LEN."""
+    T = feats.shape[0] - 1  # 可决策的时间步
+    positions = torch.zeros(T, dtype=torch.long, device=feats.device)
     with torch.no_grad():
-        logits = policy(feats[:-1])
-        positions = logits.argmax(dim=-1)             # (T-1,) GPU
+        # 滑动窗口：每次取 EPISODE_LEN 长度的片段，只取最后一个决策
+        for start in range(0, T, EPISODE_LEN):
+            end = min(start + EPISODE_LEN + 1, feats.shape[0])
+            window = feats[start:end]                    # (<=EPISODE_LEN+1, 14)
+            logits = policy(window)                      # (<=EPISODE_LEN+1, 11)
+            # 取窗口内对应的决策位（排除第一步，因为用 feats[t] 预测 position[t]）
+            n_decide = min(EPISODE_LEN, T - start)
+            positions[start:start + n_decide] = logits[:-1].argmax(dim=-1)[:n_decide]
 
     rets_f = rets[1:]                                 # GPU
     pos_w = positions.float() / 10.0                  # GPU

@@ -80,59 +80,63 @@ def train_grpo(policy, ref_policy, train_feats, train_rets,
             for sch in schedulers:
                 sch.step()
 
-    def sample_episode_batch():
-        # Pre-allocate output tensors
-        f_batch = torch.empty(BATCH_SIZE, EPISODE_LEN, train_feats[0].shape[1],
+    def sample_series_batch():
+        """Sample full training series (feats[:-1] → rets[1:] alignment)."""
+        T = train_feats[0].shape[0]
+        seq_len = T - 1
+        f_batch = torch.empty(BATCH_SIZE, seq_len, train_feats[0].shape[1],
                               device=train_feats[0].device)
-        r_batch = torch.empty(BATCH_SIZE, EPISODE_LEN, device=train_rets[0].device)
+        r_batch = torch.empty(BATCH_SIZE, seq_len, device=train_rets[0].device)
         for i in range(BATCH_SIZE):
             idx = torch.randint(len(train_feats), (1,)).item()
-            T = train_feats[idx].shape[0]
-            start = torch.randint(0, T - EPISODE_LEN - 1, (1,)).item()
-            f_batch[i] = train_feats[idx][start:start+EPISODE_LEN]
-            r_batch[i] = train_rets[idx][start+1:start+EPISODE_LEN+1]
+            f_batch[i] = train_feats[idx][:seq_len]
+            r_batch[i] = train_rets[idx][1:T]
         return f_batch, r_batch
 
-    def grpo_step():
-        feats, rets = sample_episode_batch()            # (B, T, 14), (B, T)
+    def sliding_forward(model, feats):
+        """Sliding window forward: EPISODE_LEN per window, cat results."""
+        B, T, D = feats.shape
+        parts = []
+        for start in range(0, T, EPISODE_LEN):
+            end = min(start + EPISODE_LEN, T)
+            parts.append(model(feats[:, start:end]))
+        return torch.cat(parts, dim=1)
 
-        # forward (with grad)
-        logits = policy(feats)                          # (B, T, 11)
+    def grpo_step():
+        feats, rets = sample_series_batch()          # (B, SEQ_LEN, 14), (B, SEQ_LEN)
+        seq_len = feats.shape[1]
 
         # Newton-Muon: refresh preconditioner periodically
         _global_step[0] += 1
         if _global_step[0] % muon_opt.refresh_interval == 0:
             muon_opt.update_preconditioner()
 
+        # sliding window forward (with grad)
+        logits = sliding_forward(policy, feats)       # (B, SEQ_LEN, 11)
         log_probs = F.log_softmax(logits, dim=-1)
 
         with torch.no_grad():
             old_log_probs = log_probs.detach()
             old_probs = old_log_probs.exp()
-            # sample G trajectories per episode
-            dist_cat = Categorical(old_probs)                   # (B, T, 11)
-            actions = dist_cat.sample((G_SAMPLES,))             # (G, B, T)
-            # gather old log probs
+            dist_cat = Categorical(old_probs)                   # (B, SEQ_LEN, 11)
+            actions = dist_cat.sample((G_SAMPLES,))             # (G, B, SEQ_LEN)
             old_lp = old_log_probs.unsqueeze(0).expand(G_SAMPLES, -1, -1, -1) \
                                 .gather(3, actions.unsqueeze(3)).squeeze(3)
-            # rewards & advantages
             rw = compute_rewards(actions, rets)                 # (G, B)
 
-        # normalize advantages per-episode (across G samples)
         adv = ((rw - rw.mean(0)) / (rw.std(0) + 1e-8)).detach()
 
-        # current log probs of sampled actions (with grad)
         cur_lp = log_probs.unsqueeze(0).expand(G_SAMPLES, -1, -1, -1) \
                           .gather(3, actions.unsqueeze(3)).squeeze(3)
-        ratio = (cur_lp - old_lp).exp()                        # (G, B, T)
+        ratio = (cur_lp - old_lp).exp()                        # (G, B, SEQ_LEN)
         adv_exp = adv.unsqueeze(2)                              # (G, B, 1)
         surr1 = ratio * adv_exp
         surr2 = ratio.clamp(1 - EPS_CLIP, 1 + EPS_CLIP) * adv_exp
         loss_clip = -torch.min(surr1, surr2).mean()
 
-        # KL(π_ref || π_θ)
+        # KL(π_ref || π_θ) — 同样滑动窗口
         with torch.no_grad():
-            ref_lp = F.log_softmax(ref_policy(feats), dim=-1)
+            ref_lp = F.log_softmax(sliding_forward(ref_policy, feats), dim=-1)
             ref_p  = ref_lp.exp()
         kl = (ref_p * (ref_lp - log_probs)).sum(dim=-1).mean()
 
@@ -151,7 +155,8 @@ def train_grpo(policy, ref_policy, train_feats, train_rets,
     if is_main:
         os.makedirs(OUTPUT_DIR, exist_ok=True)
         print(f"\nTraining {N_EPISODES} steps × {BATCH_SIZE} ep/step  "
-              f"(G={G_SAMPLES}, T={EPISODE_LEN}, world_size={world_size})"
+              f"(G={G_SAMPLES}, window={EPISODE_LEN}, seq={train_feats[0].shape[0]-1}, "
+              f"world_size={world_size})"
               + (f"  [resume from step {start_ep-1}]" if start_ep > 1 else ""))
     t0 = time.time()
 

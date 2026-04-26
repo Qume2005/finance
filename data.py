@@ -6,7 +6,7 @@ import torch
 
 from config import (SEED, WINDOWS,
                     N_TRAIN_SERIES, N_TEST_SERIES, N_SERIES,
-                    N_TRAIN_DAYS, N_TEST_DAYS, WARMUP,
+                    N_TRAIN_DAYS, N_TEST_DAYS,
                     TRAIN_IDS, TEST_IDS)
 
 
