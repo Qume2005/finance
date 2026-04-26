@@ -8,7 +8,8 @@ import torch.nn.functional as F
 from torch.distributions import Categorical
 
 from config import (SEED, EPISODE_LEN, G_SAMPLES, LAMBDA_DD,
-                    EPS_CLIP, BETA_KL, N_EPISODES, LR, BATCH_SIZE)
+                    EPS_CLIP, BETA_KL, N_EPISODES, LR, BATCH_SIZE,
+                    WEIGHT_DECAY)
 from muon import NewtonMuon
 
 
@@ -43,8 +44,8 @@ def train_grpo(policy, ref_policy, train_feats, train_rets,
     muon_params, sgd_params = [], []
     for p in policy.parameters():
         (muon_params if p.dim() >= 2 else sgd_params).append(p)
-    muon_opt = NewtonMuon(muon_params, lr=LR, momentum=0.618, weight_decay=1e-2)
-    sgd_opt = torch.optim.SGD(sgd_params, lr=LR, momentum=0.618, weight_decay=1e-2)
+    muon_opt = NewtonMuon(muon_params, lr=LR, momentum=0.618, weight_decay=WEIGHT_DECAY)
+    sgd_opt = torch.optim.SGD(sgd_params, lr=LR, momentum=0.618, weight_decay=WEIGHT_DECAY)
     optimizers = [muon_opt, sgd_opt]
     schedulers = [
         torch.optim.lr_scheduler.CosineAnnealingLR(opt, N_EPISODES)
