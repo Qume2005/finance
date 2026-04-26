@@ -9,25 +9,35 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.distributions import Categorical
 
-from config import (SEED, EPISODE_LEN, G_SAMPLES,
+from config import (SEED, EPISODE_LEN, G_SAMPLES, LAMBDA_REWARD, REWARD_SCALE,
                     EPS_CLIP, BETA_KL, N_EPISODES, LR, BATCH_SIZE,
                     WEIGHT_DECAY, SAVE_EVERY, OUTPUT_DIR, ENTROPY_COEFF)
 from muon import NewtonMuon
 
 
-def compute_rewards(positions, daily_returns, bh_sharpe):
-    """
-    reward = strat_sharpe - bh_sharpe
+def compute_bh_metrics(daily_returns):
+    """Pre-compute B&H baseline metrics (same across all G samples)."""
+    bh_sharpe = daily_returns.mean(-1) / (daily_returns.std(-1) + 1e-8)
+    bh_return = torch.cumprod(1.0 + daily_returns, dim=-1)[..., -1]
+    return bh_sharpe, bh_return
 
-    Cash (all-zero position) gets strat_sharpe=0:
-      bear market (bh_sharpe<0) → reward>0 → hold cash
-      bull market (bh_sharpe>0) → reward<0 → must take positions
+
+def compute_rewards(positions, daily_returns, bh_sharpe, bh_return):
+    """
+    reward = (1-λ)*(strat_sharpe - bh_sharpe) + λ*(strat_return - bh_return)
+    λ=0: 纯夏普率差值, λ=1: 纯期末收益差值
     """
     w = positions.float() / 10.0
-    strat_returns = w * daily_returns.unsqueeze(0)      # (G, B, T)
+    strat_returns = w * daily_returns.unsqueeze(0)              # (G, B, T)
+
     strat_sharpe = (strat_returns.mean(-1)
-                    / (strat_returns.std(-1) + 1e-8))   # (G, B)
-    return strat_sharpe - bh_sharpe.unsqueeze(0)        # (G, B)
+                    / (strat_returns.std(-1) + 1e-8))           # (G, B)
+    strat_return = torch.cumprod(1.0 + strat_returns, dim=-1)[..., -1]
+
+    sharpe_diff = strat_sharpe - bh_sharpe.unsqueeze(0)
+    return_diff = strat_return - bh_return.unsqueeze(0)
+    return ((1 - LAMBDA_REWARD) * sharpe_diff
+            + LAMBDA_REWARD * return_diff) * REWARD_SCALE
 
 
 def train_grpo(policy, ref_policy, train_feats, train_rets,
@@ -123,8 +133,8 @@ def train_grpo(policy, ref_policy, train_feats, train_rets,
             muon_opt._hooks = []
             muon_opt.update_preconditioner()
 
-        # Pre-compute BH Sharpe once (same for all G samples)
-        bh_sharpe = rets.mean(-1) / (rets.std(-1) + 1e-8)          # (B,)
+        # Pre-compute BH baseline metrics once (same for all G samples)
+        bh_sharpe, bh_return = compute_bh_metrics(rets)              # (B,)
 
         # sliding window forward
         logits = sliding_forward(policy, feats)                 # (B, SEQ_LEN, 11)
@@ -138,7 +148,7 @@ def train_grpo(policy, ref_policy, train_feats, train_rets,
             actions = dist_cat.sample((G_SAMPLES,))             # (G, B, SEQ_LEN)
             old_lp = old_log_probs.unsqueeze(0).expand(G_SAMPLES, -1, -1, -1) \
                                 .gather(3, actions.unsqueeze(3)).squeeze(3)
-            rw = compute_rewards(actions, rets, bh_sharpe)
+            rw = compute_rewards(actions, rets, bh_sharpe, bh_return)
 
         adv = rw.detach()
 

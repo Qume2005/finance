@@ -19,13 +19,15 @@ TEST_IDS  = list(range(N_TRAIN_SERIES, N_SERIES))
 # GRPO
 EPISODE_LEN = 50
 G_SAMPLES   = 64
+LAMBDA_REWARD = 0.5          # 0=纯夏普率差值, 1=纯期末收益差值
+REWARD_SCALE = 50
 EPS_CLIP    = 0.2
-BETA_KL     = 0.04
-ENTROPY_COEFF = 0.01
+BETA_KL     = 0.0
+ENTROPY_COEFF = 0.0
 N_EPISODES  = 5000
 SAVE_EVERY  = 500
-LR          = 1
-WEIGHT_DECAY = 0.1
+LR          = 1e-3
+WEIGHT_DECAY = 0
 BATCH_SIZE  = 16
 
 # Output
