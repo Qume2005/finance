@@ -142,8 +142,8 @@ class MoAKDALayer(nn.Module):
         self.W_u_kv = nn.Parameter(torch.randn(n_kv_experts, d_d, d_value) * 0.01)
 
         # ── Routers ──
-        self.router_q  = nn.Linear(d_input, n_q_experts)
-        self.router_kv = nn.Linear(d_input, n_kv_experts)
+        self.router_q  = nn.Linear(d_input, n_q_experts, bias=False)
+        self.router_kv = nn.Linear(d_input, n_kv_experts, bias=False)
 
     def _apply_pope(self, x, positions, is_query):
         mu = F.softplus(x)
@@ -301,7 +301,7 @@ class MoESwiGLU(nn.Module):
         self.max_k = max_k
         self.experts = nn.ModuleList([SwiGLU(d_hidden) for _ in range(n_experts)])
         self.mhc_swiglu = nn.ModuleList([MHC(d_hidden, n_mhc) for _ in range(n_experts)])
-        self.expert_router = nn.Linear(d_hidden, n_experts)
+        self.expert_router = nn.Linear(d_hidden, n_experts, bias=False)
         self.w_experts = nn.Parameter(torch.zeros(n_experts, d_hidden))
 
     def forward(self, normed_stream):
@@ -342,8 +342,7 @@ class HaltingRouter(nn.Module):
         self.d = d_hidden
         self.norm = nn.RMSNorm(nd)
         self.mix = nn.Linear(nd, nd, bias=False)
-        self.proj = nn.Linear(d_hidden, 2)
-        nn.init.constant_(self.proj.bias[0], 1.0)       # continue bias
+        self.proj = nn.Linear(d_hidden, 2, bias=False)
         # 可学习的退出线性偏置 α·T
         self.iter_alpha = nn.Parameter(torch.tensor(0.0))
 

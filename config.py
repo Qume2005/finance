@@ -21,6 +21,7 @@ EPISODE_LEN = 50
 G_SAMPLES   = 64
 LAMBDA_REWARD = 0.5          # 0=纯夏普率差值, 1=纯期末收益差值
 REWARD_SCALE = 20
+ORTHO_COEFF  = 0.1         # 路由Query向量正交正则系数
 EPS_CLIP    = 0.2
 BETA_KL     = 0.0
 ENTROPY_COEFF = 0.0
@@ -40,10 +41,10 @@ ITER_REWARD_START = 1.0     # min_iterations 时的奖励系数
 ITER_REWARD_END   = 0.75     # max_iterations 时的奖励系数
 
 # MoA / MoE
-N_Q_EXPERTS   = 24         # MoA Q 投影专家数
-N_KV_EXPERTS  = 16         # MoA K/V 投影专家数
-N_FFN_EXPERTS = 24         # MoE 前馈专家数
+N_Q_EXPERTS   = 64         # MoA Q 投影专家数
+N_KV_EXPERTS  = 48         # MoA K/V 投影专家数
+N_FFN_EXPERTS = 64         # MoE 前馈专家数
 
 # 路由参数 (Q路由, KV路由, FFN路由)
-TOP_PROB = (0.4, 0.4, 0.4)
-MAX_K    = (3, 2, 3)
+TOP_PROB = (0.8, 0.8, 0.8)
+MAX_K    = (8, 6, 8)

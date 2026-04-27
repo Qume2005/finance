@@ -13,7 +13,7 @@ from config import (SEED, EPISODE_LEN, G_SAMPLES, LAMBDA_REWARD, REWARD_SCALE,
                     EPS_CLIP, BETA_KL, N_EPISODES, LR, BATCH_SIZE,
                     WEIGHT_DECAY, SAVE_EVERY, OUTPUT_DIR, ENTROPY_COEFF,
                     MAX_ITERATIONS, MIN_ITERATIONS,
-                    ITER_REWARD_START, ITER_REWARD_END)
+                    ITER_REWARD_START, ITER_REWARD_END, ORTHO_COEFF)
 from muon import NewtonMuon
 
 
@@ -206,7 +206,25 @@ def train_grpo(policy, ref_policy, train_feats, train_rets,
         kl = (ref_p * (ref_lp - log_probs)).sum(dim=-1).mean()
 
         entropy = -(log_probs.exp() * log_probs).sum(dim=-1).mean()
-        loss = loss_clip + BETA_KL * kl - ENTROPY_COEFF * entropy
+
+        # 路由器行向量正交正则
+        if ORTHO_COEFF > 0:
+            ortho_loss = torch.tensor(0.0, device=feats.device)
+            for router in [raw_model.moa_kda.router_q,
+                           raw_model.moa_kda.router_kv,
+                           raw_model.moe_swiglu.expert_router,
+                           raw_model.router.proj]:                   # halting STE
+                W = F.normalize(router.weight, dim=1)               # (E, d) 按行归一
+                E = W.shape[0]
+                G = W @ W.T                                         # (E, E)
+                mask = ~torch.eye(E, dtype=torch.bool, device=G.device)
+                dot_sum = G[mask].sum()                             # 两两点乘之和
+                ortho_loss = ortho_loss + dot_sum.pow(2) / E
+            ortho_loss = ORTHO_COEFF * ortho_loss
+        else:
+            ortho_loss = torch.tensor(0.0, device=feats.device)
+
+        loss = loss_clip + BETA_KL * kl - ENTROPY_COEFF * entropy + ortho_loss
         for opt in optimizers:
             opt.zero_grad()
         loss.backward()
