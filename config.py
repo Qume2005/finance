@@ -4,7 +4,7 @@ SEED = 16
 WINDOWS = [5, 10, 20, 30, 50, 100, 200]
 
 # ── 序列数量 ──
-N_TRAIN_SERIES = 10000      # 训练序列数
+N_TRAIN_SERIES = 100000      # 训练序列数
 N_TEST_SERIES  = 20        # 测试序列数
 N_SERIES = N_TRAIN_SERIES + N_TEST_SERIES
 
@@ -25,11 +25,11 @@ ORTHO_COEFF  = 0.1         # 路由Query向量正交正则系数
 EPS_CLIP    = 0.2
 BETA_KL     = 0.0
 ENTROPY_COEFF = 0.0
-N_EPISODES  = 5000
+N_EPISODES  = 50000
 SAVE_EVERY  = 500
 LR          = 1e-3
 WEIGHT_DECAY = 0
-BATCH_SIZE  = 16
+BATCH_SIZE  = 128
 
 # Output
 OUTPUT_DIR = "output"

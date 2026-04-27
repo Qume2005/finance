@@ -139,7 +139,7 @@ class MoAKDALayer(nn.Module):
         self.post_norm_kv = nn.ModuleList([nn.RMSNorm(d_value) for _ in range(n_kv_experts)])
         d_d = int(d_value / 1.618)
         self.W_d_kv = nn.Parameter(torch.randn(n_kv_experts, d_input, d_d) * 0.01)
-        self.W_u_kv = nn.Parameter(torch.randn(n_kv_experts, d_d, d_value) * 0.01)
+        self.W_u_kv = nn.Parameter(torch.randn(n_kv_experts, d_d, d_input) * 0.01)
 
         # ── Routers ──
         self.router_q  = nn.Linear(d_input, n_q_experts, bias=False)
@@ -253,10 +253,10 @@ class MoAKDALayer(nn.Module):
         # ── Phase 3b: KV-expert post-processing ──
         for e in range(Ek):
             out_e = self.post_norm_kv[e](out)
+            out_e = self.W_out(out_e)
             gate_e = torch.sigmoid(
                 F.silu(h_kv_list[e] @ self.W_d_kv[e]) @ self.W_u_kv[e])
-            out_e = out_e * gate_e
-            out_e = self.W_out(out_e)
+            out_e = gate_e * out_e
 
             g = gate_kv[:, :, e].view(B, 1, T, 1)
             res = torch.einsum('btij,bjtd->bitd', H_res_kv[e], normed_stream)
@@ -275,7 +275,7 @@ class SwiGLU(nn.Module):
         d_ffn = int(d_input * 1.618)
         self.norm = nn.RMSNorm(d_input)
         self.wd = nn.Linear(d_input, d_input, bias=False)
-        self.wu = nn.Linear(d_input, d_ffn, bias=False)
+        self.wu = nn.Linear(d_input, d_input, bias=False)
         self.gate = nn.Linear(d_input, d_ffn, bias=False)
         self.up   = nn.Linear(d_input, d_ffn, bias=False)
         self.down = nn.Linear(d_ffn, d_input, bias=False)
@@ -283,7 +283,7 @@ class SwiGLU(nn.Module):
     def forward(self, x):
         h = self.norm(x)
         g = torch.sigmoid(self.wu(F.silu(self.wd(h))))
-        return self.down(g * (F.silu(self.gate(h)) * self.up(h)))
+        return g * self.down(F.silu(self.gate(h)) * self.up(h))
 
 
 # ────────────────── MoE Expert ──────────────────
@@ -478,10 +478,11 @@ class KDAPolicyNetwork(nn.Module):
         acc = [stream]
         active = torch.ones(B, dtype=torch.bool, device=x.device)
         exit_iter = torch.full((B,), float(self.max_iterations), device=x.device)
+        sample_depth = torch.zeros(B, dtype=torch.long, device=x.device)
 
         for i in range(self.max_iterations):
-            # ── STE route ──
-            iter_t = torch.full((B,), i, dtype=torch.long, device=x.device)
+            # ── STE route ── iter_t 冻结已退出样本，仅活跃样本递增
+            iter_t = sample_depth
             logits = self.router(stream, iter_idx=iter_t)
             ste, hard = _ste_route(logits)
 
@@ -525,6 +526,7 @@ class KDAPolicyNetwork(nn.Module):
                                     torch.tensor(float(i + 1), device=x.device),
                                     exit_iter)
             active = active & hard_cont
+            sample_depth = sample_depth + active.long()
             if not active.any():
                 break
 
