@@ -7,7 +7,9 @@ Usage:
   Multi-GPU:   torchrun --nproc_per_node=N mm_grpo_strategy.py
 """
 
-import os, warnings
+import os
+import warnings
+
 os.environ.setdefault("TORCH_NCCL_ASYNC_ERROR_HANDLING", "1")
 import torch
 import torch.distributed as dist
@@ -19,8 +21,7 @@ warnings.filterwarnings("ignore")
 
 import numpy as np
 
-from config import (SEED, N_TRAIN_SERIES, N_TEST_SERIES, N_TRAIN_DAYS, N_TEST_DAYS,
-                    OUTPUT_DIR)
+from config import (SEED, OUTPUT_DIR)
 from data import prepare_datasets, prepare_test_data
 from model import KDAPolicyNetwork
 from train import train_grpo

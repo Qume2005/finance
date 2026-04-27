@@ -11,7 +11,9 @@ from torch.distributions import Categorical
 
 from config import (SEED, EPISODE_LEN, G_SAMPLES, LAMBDA_REWARD, REWARD_SCALE,
                     EPS_CLIP, BETA_KL, N_EPISODES, LR, BATCH_SIZE,
-                    WEIGHT_DECAY, SAVE_EVERY, OUTPUT_DIR, ENTROPY_COEFF)
+                    WEIGHT_DECAY, SAVE_EVERY, OUTPUT_DIR, ENTROPY_COEFF,
+                    MAX_ITERATIONS, MIN_ITERATIONS,
+                    ITER_REWARD_START, ITER_REWARD_END)
 from muon import NewtonMuon
 
 
@@ -54,7 +56,7 @@ def train_grpo(policy, ref_policy, train_feats, train_rets,
     # NewtonMuon for 2D params, SGD for the rest (biases, norms, etc.)
     muon_params, sgd_params = [], []
     for p in policy.parameters():
-        (muon_params if p.dim() >= 2 else sgd_params).append(p)
+        (muon_params if p.dim() == 2 else sgd_params).append(p)
     muon_opt = NewtonMuon(muon_params, lr=LR, momentum=0.618, weight_decay=WEIGHT_DECAY)
     sgd_opt = torch.optim.SGD(sgd_params, lr=LR, momentum=0.618, weight_decay=WEIGHT_DECAY)
     optimizers = [muon_opt, sgd_opt]
@@ -108,15 +110,25 @@ def train_grpo(policy, ref_policy, train_feats, train_rets,
             feats = torch.cat([feats, feats.new_zeros(B, pad, D)], dim=1)
 
         all_logits = []
+        all_exit_iters = []
         kda_states = init_kda_states
         for w in range(n_w):
             window = feats[:, w * EPISODE_LEN:(w + 1) * EPISODE_LEN, :]
-            logits, kda_states = model(window, kda_states=kda_states)
+            logits, kda_states, exit_iter = model(window, kda_states=kda_states)
             if model.training:
                 kda_states = [s.detach() for s in kda_states]
-            all_logits.append(logits)
+            # 中间窗口去掉 EOS，最后一个窗口保留 EOS
+            if w < n_w - 1:
+                all_logits.append(logits[:, :-1, :])
+            else:
+                all_logits.append(logits)
+            all_exit_iters.append(exit_iter)               # (B,) per window
 
-        return torch.cat(all_logits, dim=1)[:, :T, :], kda_states
+        total = torch.cat(all_logits, dim=1)
+        # 取前 T 步（真实预测）+ 最后 1 步（EOS）= T+1
+        # exit_iter: 取最后一个窗口的（代表最终退出深度）
+        return (torch.cat([total[:, :T, :], total[:, -1:, :]], dim=1),
+                kda_states, all_exit_iters[-1])
 
     def grpo_step():
         feats, rets = sample_series_batch()          # (B, SEQ_LEN, 14), (B, SEQ_LEN)
@@ -135,8 +147,8 @@ def train_grpo(policy, ref_policy, train_feats, train_rets,
 
         # KDA 预热：前 EPISODE_LEN 步只积累状态，不预测
         with torch.no_grad():
-            _, policy_warmup = sliding_forward(policy, feats[:, :EPISODE_LEN, :])
-            _, ref_warmup = sliding_forward(ref_policy, feats[:, :EPISODE_LEN, :])
+            _, policy_warmup, _ = sliding_forward(policy, feats[:, :EPISODE_LEN, :])
+            _, ref_warmup, _ = sliding_forward(ref_policy, feats[:, :EPISODE_LEN, :])
 
         # 预热后的特征和收益
         pred_feats = feats[:, EPISODE_LEN:, :]                    # (B, SEQ_LEN-50, 14)
@@ -146,23 +158,38 @@ def train_grpo(policy, ref_policy, train_feats, train_rets,
         bh_sharpe, bh_return = compute_bh_metrics(pred_rets)       # (B,)
 
         # sliding window forward (with warm-up KDA states)
-        logits, _ = sliding_forward(policy, pred_feats,
-                                     init_kda_states=policy_warmup)
+        logits, _, exit_iters = sliding_forward(policy, pred_feats,
+                                                init_kda_states=policy_warmup)
+
+        # logits: (B, T+1, 11) — T real steps + 1 EOS
+        T_real = pred_rets.shape[1]
 
         # float32 log_softmax — avoids -inf in fp16 causing zero-prob Categorical
         log_probs = F.log_softmax(logits.float(), dim=-1)
+        log_probs_real = log_probs[:, :T_real, :]            # (B, T, 11) for action/reward
 
         with torch.no_grad():
-            old_log_probs = log_probs.detach()
+            old_log_probs = log_probs_real.detach()
             dist_cat = Categorical(logits=old_log_probs)
-            actions = dist_cat.sample((G_SAMPLES,))                 # (G, B, SEQ_LEN-50)
+            actions = dist_cat.sample((G_SAMPLES,))                 # (G, B, T)
             old_lp = old_log_probs.unsqueeze(0).expand(G_SAMPLES, -1, -1, -1) \
                                 .gather(3, actions.unsqueeze(3)).squeeze(3)
             rw = compute_rewards(actions, pred_rets, bh_sharpe, bh_return)
 
         adv = rw.detach()
 
-        cur_lp = log_probs.unsqueeze(0).expand(G_SAMPLES, -1, -1, -1) \
+        # ── 迭代深度奖励缩放 ──
+        # exit_iters: (B,), 值域 [min_iterations, max_iterations]
+        # 线性从 ITER_REWARD_START 到 ITER_REWARD_END
+        iter_range = MAX_ITERATIONS - MIN_ITERATIONS
+        if iter_range > 0:
+            t_frac = ((exit_iters - MIN_ITERATIONS) / iter_range).clamp(0, 1)
+        else:
+            t_frac = torch.zeros_like(exit_iters)
+        iter_scale = ITER_REWARD_START + (ITER_REWARD_END - ITER_REWARD_START) * t_frac
+        adv = adv * iter_scale.unsqueeze(0)                 # (G, B)
+
+        cur_lp = log_probs_real.unsqueeze(0).expand(G_SAMPLES, -1, -1, -1) \
                           .gather(3, actions.unsqueeze(3)).squeeze(3)
         ratio = (cur_lp - old_lp).exp()
         adv_exp = adv.unsqueeze(2)
@@ -170,10 +197,10 @@ def train_grpo(policy, ref_policy, train_feats, train_rets,
         surr2 = ratio.clamp(1 - EPS_CLIP, 1 + EPS_CLIP) * adv_exp
         loss_clip = -torch.min(surr1, surr2).mean()
 
-        # KL(π_ref || π_θ)
+        # KL(π_ref || π_θ) — includes EOS
         with torch.no_grad():
-            ref_logits, _ = sliding_forward(ref_policy, pred_feats,
-                                             init_kda_states=ref_warmup)
+            ref_logits, _, _ = sliding_forward(ref_policy, pred_feats,
+                                                init_kda_states=ref_warmup)
             ref_lp = F.log_softmax(ref_logits.float(), dim=-1)
             ref_p  = ref_lp.exp()
         kl = (ref_p * (ref_lp - log_probs)).sum(dim=-1).mean()

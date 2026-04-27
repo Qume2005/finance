@@ -28,7 +28,7 @@ def backtest_series(policy, feats, rets, label=""):
 
         # KDA 预热：前 EPISODE_LEN 步只积累状态
         warmup = f[:EPISODE_LEN].unsqueeze(0)
-        _, kda_states = policy(warmup, kda_states=None)
+        _, kda_states, _ = policy(warmup, kda_states=None)
 
         # 预测：剩余步
         pred_f = f[EPISODE_LEN:]
@@ -41,8 +41,8 @@ def backtest_series(policy, feats, rets, label=""):
         all_logits = []
         for w in range(pred_n_w):
             window = pred_f[w * EPISODE_LEN:(w + 1) * EPISODE_LEN].unsqueeze(0)
-            logits_w, kda_states = policy(window, kda_states=kda_states)
-            all_logits.append(logits_w.squeeze(0))
+            logits_w, kda_states, _ = policy(window, kda_states=kda_states)
+            all_logits.append(logits_w.squeeze(0)[:-1, :])   # strip EOS
 
         logits = torch.cat(all_logits, dim=0)[:T - EPISODE_LEN]
         positions = logits.argmax(dim=-1)

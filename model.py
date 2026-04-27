@@ -1,10 +1,12 @@
-"""Mini-KDA Policy Network with PoPE, mHC, AttnRes, SwiGLU."""
+"""Mini-KDA Policy Network with PoPE, mHC, AttnRes, MoA, MoE, dynamic loop."""
 
 import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+
+# ────────────────── Utilities ──────────────────
 
 def sinkhorn_knopp(M, n_iters=6):
     """Project (..., n, n) to doubly stochastic matrix."""
@@ -14,6 +16,27 @@ def sinkhorn_knopp(M, n_iters=6):
         M = M / M.sum(dim=-2, keepdim=True)
     return M
 
+
+def top_prob_max_k(logits, threshold=0.8, max_k=4):
+    """
+    Top-Prob&max-K routing: cumulative probability cutoff with K upper limit.
+    logits: (..., n_experts) → gates: (..., n_experts) sparse, renormalized.
+    """
+    probs = F.softmax(logits, dim=-1)
+    sorted_p, sorted_idx = probs.sort(dim=-1, descending=True)
+    cumsum = sorted_p.cumsum(dim=-1)
+
+    arange = torch.arange(logits.shape[-1], device=logits.device)
+    mask = (cumsum - sorted_p < threshold) & (arange < max_k)
+    mask[..., 0] = True                                # at least 1 expert
+
+    selected = sorted_p * mask.float()
+
+    gates = torch.zeros_like(probs).scatter_(dim=-1, index=sorted_idx, src=selected)
+    return gates
+
+
+# ────────────────── mHC ──────────────────
 
 class MHC(nn.Module):
     """
@@ -48,6 +71,8 @@ class MHC(nn.Module):
         return H_res, H_pre, H_post
 
 
+# ────────────────── Compiled KDA step ──────────────────
+
 @torch.compile
 def _kda_step(q_t, k_t, v_t, alpha_t, beta_t, S):
     """Single KDA recursion step — compiled as a small graph."""
@@ -61,29 +86,64 @@ def _kda_step(q_t, k_t, v_t, alpha_t, beta_t, S):
     return out_t, S
 
 
-class MiniKDALayer(nn.Module):
-    """KDA delta attention with PoPE, SwiGLU alpha gate, beta gate."""
-    def __init__(self, d_input, d_key=16, d_value=16):
+# ────────────────── MoA Attention ──────────────────
+
+class MoAKDALayer(nn.Module):
+    """
+    MoA-KDA: shared base W_q/W_k/W_v + per-expert LoRA + per-expert mHC/gates.
+    Q experts and KV experts have separate counts.
+    Single KDA pass with combined projections.
+    """
+    def __init__(self, d_input, d_key=16, d_value=16,
+                 n_q_experts=16, n_kv_experts=16, n_mhc=4,
+                 q_top_prob=0.8, q_max_k=4, kv_top_prob=0.8, kv_max_k=4):
         super().__init__()
         self.dk, self.dv = d_key, d_value
         self.dk_pope = d_key * 2
+        self.q_top_prob = q_top_prob
+        self.q_max_k = q_max_k
+        self.kv_top_prob = kv_top_prob
+        self.kv_max_k = kv_max_k
+        self.n_q_experts = n_q_experts
+        self.n_kv_experts = n_kv_experts
+        r = max(d_key // 4, 1)                          # LoRA rank = d_key / 4
+
+        # ── Shared base projections ──
         self.register_buffer(
             'freqs', 10000.0 ** (torch.arange(d_key).float() / d_key))
         self.W_q = nn.Linear(d_input, d_key, bias=False)
         self.W_k = nn.Linear(d_input, d_key, bias=False)
         self.W_v = nn.Linear(d_input, d_value, bias=False)
         self.pope_delta_raw = nn.Parameter(torch.zeros(d_key))
-        d_alpha = int(d_key * 1.618)
-        self.alpha_up   = nn.Linear(d_input, d_alpha, bias=False)
-        self.alpha_down = nn.Linear(d_alpha, self.dk_pope, bias=False)
-        # β gate: head-wise scalar ∈ [0,1], low-rank projection (Eq.8)
-        self.beta_up   = nn.Linear(d_input, d_alpha, bias=False)
-        self.beta_down = nn.Linear(d_alpha, 1, bias=False)
-        self.post_norm = nn.RMSNorm(d_value)
-        d_d = int(d_value / 1.618)
-        self.W_d = nn.Linear(d_input, d_d, bias=False)
-        self.W_u = nn.Linear(d_d, d_value, bias=False)
         self.W_out = nn.Linear(d_value, d_input, bias=False)
+
+        # ── Q-expert params (LoRA_q + mHC + post_norm) ──
+        self.lora_A_q = nn.Parameter(torch.randn(n_q_experts, d_input, r) * 0.01)
+        self.lora_B_q = nn.Parameter(torch.zeros(n_q_experts, r, d_key))
+        self.mhc_q    = nn.ModuleList([MHC(d_input, n_mhc) for _ in range(n_q_experts)])
+        self.post_norm_q = nn.ModuleList([nn.RMSNorm(d_value) for _ in range(n_q_experts)])
+
+        # ── KV-expert params (LoRA_k/v + alpha/beta + mHC + post_norm + W_d/W_u) ──
+        self.lora_A_k = nn.Parameter(torch.randn(n_kv_experts, d_input, r) * 0.01)
+        self.lora_B_k = nn.Parameter(torch.zeros(n_kv_experts, r, d_key))
+        self.lora_A_v = nn.Parameter(torch.randn(n_kv_experts, d_input, r) * 0.01)
+        self.lora_B_v = nn.Parameter(torch.zeros(n_kv_experts, r, d_value))
+
+        d_alpha = int(d_key * 1.618)
+        self.alpha_up_w   = nn.Parameter(torch.randn(n_kv_experts, d_input, d_alpha) * 0.01)
+        self.alpha_down_w = nn.Parameter(torch.randn(n_kv_experts, d_alpha, self.dk_pope) * 0.01)
+        self.beta_up_w    = nn.Parameter(torch.randn(n_kv_experts, d_input, d_alpha) * 0.01)
+        self.beta_down_w  = nn.Parameter(torch.randn(n_kv_experts, d_alpha, 1) * 0.01)
+
+        self.mhc_kv      = nn.ModuleList([MHC(d_input, n_mhc) for _ in range(n_kv_experts)])
+        self.post_norm_kv = nn.ModuleList([nn.RMSNorm(d_value) for _ in range(n_kv_experts)])
+        d_d = int(d_value / 1.618)
+        self.W_d_kv = nn.Parameter(torch.randn(n_kv_experts, d_input, d_d) * 0.01)
+        self.W_u_kv = nn.Parameter(torch.randn(n_kv_experts, d_d, d_value) * 0.01)
+
+        # ── Routers ──
+        self.router_q  = nn.Linear(d_input, n_q_experts)
+        self.router_kv = nn.Linear(d_input, n_kv_experts)
 
     def _apply_pope(self, x, positions, is_query):
         mu = F.softplus(x)
@@ -96,7 +156,6 @@ class MiniKDALayer(nn.Module):
 
     @torch.compiler.disable
     def _kda_recursion(self, q, k, v, alpha, beta, T, S_init=None):
-        """Sequential KDA update — loop disabled from compile, body compiled."""
         B = q.shape[0]
         S = S_init if S_init is not None else q.new_zeros(B, self.dk_pope, self.dv)
         out = q.new_empty(B, T, self.dv)
@@ -105,20 +164,109 @@ class MiniKDALayer(nn.Module):
                                      alpha[:, t], beta[:, t], S)
         return out, S
 
-    def forward(self, x_seq, S_init=None):
-        B, T, d = x_seq.shape
-        positions = torch.arange(T, device=x_seq.device)
-        q = self._apply_pope(F.normalize(self.W_q(x_seq), dim=-1), positions, is_query=True)
-        k = self._apply_pope(F.normalize(self.W_k(x_seq), dim=-1), positions, is_query=False)
-        v = F.silu(self.W_v(x_seq))
-        alpha = F.sigmoid(self.alpha_down(F.silu(self.alpha_up(x_seq))))
-        beta = F.sigmoid(self.beta_down(F.silu(self.beta_up(x_seq))))   # (B, T, 1)
-        out, S_final = self._kda_recursion(q, k, v, alpha, beta, T, S_init=S_init)
+    def forward(self, normed_stream, S_init=None):
+        """
+        normed_stream: (B, n_mhc, T, d) pre-normed
+        Returns: stream_update (B, n_mhc, T, d), S_new
+        """
+        B, n, T, d = normed_stream.shape
+        Eq = self.n_q_experts
+        Ek = self.n_kv_experts
+        positions = torch.arange(T, device=normed_stream.device)
 
-        out = self.post_norm(out)
-        out = out * torch.sigmoid(self.W_u(F.silu(self.W_d(x_seq))))
-        return self.W_out(out), S_final
+        # ── Token-wise routing ──
+        route_input = normed_stream.mean(dim=1)          # (B, T, d)
+        gate_q  = top_prob_max_k(self.router_q(route_input),
+                                  self.q_top_prob, self.q_max_k)   # (B, T, Eq)
+        gate_kv = top_prob_max_k(self.router_kv(route_input),
+                                  self.kv_top_prob, self.kv_max_k)  # (B, T, Ek)
 
+        # ── Phase 1a: Q-experts → accumulate weighted q ──
+        q_total  = normed_stream.new_zeros(B, T, self.dk_pope)
+        h_q_list = []
+        H_res_q  = []
+        H_post_q = []
+
+        for e in range(Eq):
+            H_res, H_pre, H_post = self.mhc_q[e](normed_stream)
+            h_e = torch.einsum('btn,bntd->btd', H_pre, normed_stream)
+            h_q_list.append(h_e)
+            H_res_q.append(H_res)
+            H_post_q.append(H_post)
+
+            delta_q = F.silu(h_e @ self.lora_A_q[e]) @ self.lora_B_q[e]
+            q_e = self._apply_pope(
+                F.normalize(self.W_q(h_e) + delta_q, dim=-1), positions, True)
+
+            g = gate_q[:, :, e].unsqueeze(-1)            # (B, T, 1)
+            q_total += g * q_e
+
+        # ── Phase 1b: KV-experts → accumulate weighted k/v/alpha/beta ──
+        k_total     = normed_stream.new_zeros(B, T, self.dk_pope)
+        v_total     = normed_stream.new_zeros(B, T, self.dv)
+        alpha_total = normed_stream.new_zeros(B, T, self.dk_pope)
+        beta_total  = normed_stream.new_zeros(B, T, 1)
+        h_kv_list   = []
+        H_res_kv    = []
+        H_post_kv   = []
+
+        for e in range(Ek):
+            H_res, H_pre, H_post = self.mhc_kv[e](normed_stream)
+            h_e = torch.einsum('btn,bntd->btd', H_pre, normed_stream)
+            h_kv_list.append(h_e)
+            H_res_kv.append(H_res)
+            H_post_kv.append(H_post)
+
+            delta_k = F.silu(h_e @ self.lora_A_k[e]) @ self.lora_B_k[e]
+            k_e = self._apply_pope(
+                F.normalize(self.W_k(h_e) + delta_k, dim=-1), positions, False)
+
+            delta_v = F.silu(h_e @ self.lora_A_v[e]) @ self.lora_B_v[e]
+            v_e = F.silu(self.W_v(h_e) + delta_v)
+
+            alpha_e = torch.sigmoid(
+                F.silu(h_e @ self.alpha_up_w[e]) @ self.alpha_down_w[e])
+            beta_e = torch.sigmoid(
+                F.silu(h_e @ self.beta_up_w[e]) @ self.beta_down_w[e])
+
+            g = gate_kv[:, :, e].unsqueeze(-1)
+            k_total     += g * k_e
+            v_total     += g * v_e
+            alpha_total += g * alpha_e
+            beta_total  += g * beta_e
+
+        # ── Phase 2: single KDA pass ──
+        out, S_new = self._kda_recursion(
+            q_total, k_total, v_total, alpha_total, beta_total, T, S_init)
+
+        # ── Phase 3a: Q-expert post-processing ──
+        stream_update = normed_stream.new_zeros(B, n, T, d)
+        for e in range(Eq):
+            out_e = self.post_norm_q[e](out)
+            out_e = self.W_out(out_e)
+
+            g = gate_q[:, :, e].view(B, 1, T, 1)
+            res = torch.einsum('btij,bjtd->bitd', H_res_q[e], normed_stream)
+            post = torch.einsum('btn,btd->bntd', H_post_q[e], out_e)
+            stream_update += g * (res + post)
+
+        # ── Phase 3b: KV-expert post-processing ──
+        for e in range(Ek):
+            out_e = self.post_norm_kv[e](out)
+            gate_e = torch.sigmoid(
+                F.silu(h_kv_list[e] @ self.W_d_kv[e]) @ self.W_u_kv[e])
+            out_e = out_e * gate_e
+            out_e = self.W_out(out_e)
+
+            g = gate_kv[:, :, e].view(B, 1, T, 1)
+            res = torch.einsum('btij,bjtd->bitd', H_res_kv[e], normed_stream)
+            post = torch.einsum('btn,btd->bntd', H_post_kv[e], out_e)
+            stream_update += g * (res + post)
+
+        return stream_update, S_new
+
+
+# ────────────────── SwiGLU (building block) ──────────────────
 
 class SwiGLU(nn.Module):
     """SwiGLU with bottleneck gate and RMSNorm."""
@@ -138,49 +286,139 @@ class SwiGLU(nn.Module):
         return self.down(g * (F.silu(self.gate(h)) * self.up(h)))
 
 
+# ────────────────── MoE Expert ──────────────────
+
+class MoESwiGLU(nn.Module):
+    """
+    MoE-SwiGLU: per-expert SwiGLU + per-expert mHC + per-expert AttnRes w.
+    Returns stream update and gate_moe for external AttnRes query combination.
+    """
+    def __init__(self, d_hidden, n_experts=16, n_mhc=4,
+                 top_prob=0.8, max_k=4):
+        super().__init__()
+        self.n_experts = n_experts
+        self.top_prob = top_prob
+        self.max_k = max_k
+        self.experts = nn.ModuleList([SwiGLU(d_hidden) for _ in range(n_experts)])
+        self.mhc_swiglu = nn.ModuleList([MHC(d_hidden, n_mhc) for _ in range(n_experts)])
+        self.expert_router = nn.Linear(d_hidden, n_experts)
+        self.w_experts = nn.Parameter(torch.zeros(n_experts, d_hidden))
+
+    def forward(self, normed_stream):
+        """
+        normed_stream: (B, n_mhc, T, d)
+        Returns: stream_update (B, n_mhc, T, d), gate_moe (B, T, E)
+        """
+        B, n, T, d = normed_stream.shape
+        E = self.n_experts
+
+        route_input = normed_stream.mean(dim=1)           # (B, T, d)
+        gate_moe = top_prob_max_k(self.expert_router(route_input),
+                                   self.top_prob, self.max_k)  # (B, T, E)
+
+        stream_update = normed_stream.new_zeros(B, n, T, d)
+
+        for e in range(E):
+            H_res, H_pre, H_post = self.mhc_swiglu[e](normed_stream)
+            h_e = torch.einsum('btn,bntd->btd', H_pre, normed_stream)
+            out_e = self.experts[e](h_e)                  # (B, T, d)
+
+            g = gate_moe[:, :, e].view(B, 1, T, 1)
+            res = torch.einsum('btij,bjtd->bitd', H_res, normed_stream)
+            post = torch.einsum('btn,btd->bntd', H_post, out_e)
+            stream_update += g * (res + post)
+
+        return stream_update, gate_moe
+
+
+# ────────────────── Halting (dynamic loop) ──────────────────
+
+class HaltingRouter(nn.Module):
+    """Per-sample halting router with linear exit bias α·T."""
+    def __init__(self, d_hidden, n_mhc, max_iterations=12):
+        super().__init__()
+        nd = n_mhc * d_hidden
+        self.n_mhc = n_mhc
+        self.d = d_hidden
+        self.norm = nn.RMSNorm(nd)
+        self.mix = nn.Linear(nd, nd, bias=False)
+        self.proj = nn.Linear(d_hidden, 2)
+        nn.init.constant_(self.proj.bias[0], 1.0)       # continue bias
+        # 可学习的退出线性偏置 α·T
+        self.iter_alpha = nn.Parameter(torch.tensor(0.0))
+
+    def forward(self, stream, iter_idx):
+        """
+        stream: (B, n, T, d)
+        iter_idx: (B,) long tensor — current iteration index
+        """
+        B, n, T, d = stream.shape
+        last = stream[:, :, -1, :]
+        x = self.norm(last.reshape(B, n * d))
+        x = self.mix(x)
+        x = x.reshape(B, n, d).sum(dim=1)               # (B, d)
+
+        logits = self.proj(x)                             # (B, 2)
+        logits[:, 1] = logits[:, 1] + F.silu(self.iter_alpha) * iter_idx.float()
+        return logits
+
+
+def _ste_route(logits):
+    """STE 2-way gate: forward=argmax, backward=straight-through softmax."""
+    soft = F.softmax(logits, dim=-1)                      # (B, 2)
+    hard_idx = logits.argmax(dim=-1)
+    hard = (hard_idx == 0).float()                        # 1=continue, 0=exit
+    ste = soft[:, 0] + (hard - soft[:, 0]).detach()
+    return ste, hard
+
+
+# ────────────────── Main Network ──────────────────
+
 class KDAPolicyNetwork(nn.Module):
     """
-    KDA + SwiGLU with mHC (n=4) and AttnRes (with pre W) depth aggregation.
+    Dynamic-depth MoA-KDA + MoE-SwiGLU with mHC, AttnRes, STE halting router.
 
-    mHC: n-stream residual with Sinkhorn-Knopp doubly stochastic mixing
-    AttnRes: softmax attention over depth with learned key projection (pre W)
-
-    Input : (T, 14)  MMn diff features
-    Output: (T, 11)  logits for positions 0-10
+    Shared single MoA+MoE block looped dynamically.  STE router decides
+    per-sample continue/exit.  Per-expert mHC, post_norm, gates, AttnRes w.
     """
-    def __init__(self, d_input=14, d_hidden=48, n_actions=11, n_layers=12, n_mhc=4):
+    def __init__(self, d_input=14, d_hidden=48, n_actions=11,
+                 max_iterations=12, n_mhc=4, min_iterations=1,
+                 n_q_experts=16, n_kv_experts=16, n_ffn_experts=16,
+                 q_top_prob=0.8, q_max_k=4,
+                 kv_top_prob=0.8, kv_max_k=4,
+                 ffn_top_prob=0.8, ffn_max_k=4):
         super().__init__()
-        self.n_layers = n_layers
+        self.max_iterations = max_iterations
+        self.min_iterations = min_iterations
         self.n_mhc = n_mhc
         self.d = d_hidden
 
         self.inp_proj = nn.Sequential(
             nn.Linear(d_input, d_hidden), nn.SiLU(), nn.RMSNorm(d_hidden))
 
-        # pre-norm for each sub-layer, applied to stream before mHC
+        # Learned [EOS] embedding — appended after the sequence
+        self.eos = nn.Parameter(torch.randn(d_hidden) * 0.02)
+
+        # Shared pre-norms (applied before MoA/MoE)
         self.stream_norms = nn.ModuleList([
-            nn.RMSNorm(d_hidden) for _ in range(n_layers * 2)])
+            nn.RMSNorm(d_hidden) for _ in range(2)])     # [attn, swiglu]
 
-        self.kda_layers = nn.ModuleList([
-            MiniKDALayer(d_hidden) for _ in range(n_layers)])
-        self.swiglu_layers = nn.ModuleList([
-            SwiGLU(d_hidden) for _ in range(n_layers)])
+        # MoA-KDA + MoE-SwiGLU
+        self.moa_kda = MoAKDALayer(d_hidden, n_q_experts=n_q_experts,
+                                    n_kv_experts=n_kv_experts, n_mhc=n_mhc,
+                                    q_top_prob=q_top_prob, q_max_k=q_max_k,
+                                    kv_top_prob=kv_top_prob, kv_max_k=kv_max_k)
+        self.moe_swiglu = MoESwiGLU(d_hidden, n_experts=n_ffn_experts, n_mhc=n_mhc,
+                                     top_prob=ffn_top_prob, max_k=ffn_max_k)
 
-        # mHC per sub-layer (attention + swiglu each have their own)
-        self.mhc = nn.ModuleList([
-            MHC(d_hidden, n_mhc) for _ in range(n_layers * 2)])
+        # STE halting
+        self.router = HaltingRouter(d_hidden, n_mhc, max_iterations)
 
-        # AttnRes with per-layer stream projection (preH: n*d → d)
+        # AttnRes: shared preH + final w
         self.attn_res_norm = nn.RMSNorm(d_hidden)
-        self.preH = nn.ModuleList([
-            nn.Linear(n_mhc * d_hidden, d_hidden, bias=False)
-            for _ in range(n_layers)])
-        # self.w = nn.ParameterList([
-        #     nn.Parameter(torch.zeros(d_hidden))
-        #     for _ in range(n_layers * 2 + 1)])
-        self.w = nn.ParameterList([
-            nn.Parameter(torch.zeros(d_hidden))
-            for _ in range(n_layers)])
+        self.preH_iter  = nn.Linear(n_mhc * d_hidden, d_hidden, bias=False)
+        self.preH_final = nn.Linear(n_mhc * d_hidden, d_hidden, bias=False)
+        self.w_final = nn.Parameter(torch.zeros(d_hidden))
 
         # Head
         d_head = int(d_hidden * 1.618)
@@ -191,31 +429,33 @@ class KDAPolicyNetwork(nn.Module):
         self._init_weights()
 
     def _init_weights(self):
-        """Depth-scaled init: residual output projections × 1/√depth."""
-        depth = self.n_layers * 2                          # 16 sub-layers
-        scale = depth ** -0.5                              # 0.25
-        for layer in self.kda_layers:
-            nn.init.normal_(layer.W_out.weight, std=scale * (2.0 / layer.W_out.in_features) ** 0.5)
-        for layer in self.swiglu_layers:
-            nn.init.normal_(layer.down.weight, std=scale * (2.0 / layer.down.in_features) ** 0.5)
+        depth = self.max_iterations * 2
+        scale = depth ** -0.5
+        nn.init.normal_(self.moa_kda.W_out.weight,
+                        std=scale * (2.0 / self.moa_kda.W_out.in_features) ** 0.5)
+        for expert in self.moe_swiglu.experts:
+            nn.init.normal_(expert.down.weight,
+                            std=scale * (2.0 / expert.down.in_features) ** 0.5)
         nn.init.normal_(self.head_down.weight,
                         std=scale * (2.0 / self.head_down.in_features) ** 0.5)
-        for ph in self.preH:
-            nn.init.normal_(ph.weight, std=scale)
+        nn.init.normal_(self.preH_iter.weight, std=scale)
+        nn.init.normal_(self.preH_final.weight, std=scale)
 
     @torch.compiler.disable
     def _attn_res(self, acc, w_l, pre_h):
-        """AttnRes: project streams (B,n,T,d)→(B,T,d), then softmax weighted sum."""
+        """AttnRes: project streams → softmax weighted sum. w_l: (d,) or (B,T,d)."""
         projected = []
         for a in acc:
-            # a: (B, n, T, d) → (B, T, n*d) → pre_h → (B, T, d)
             B, n, T, d = a.shape
             projected.append(pre_h(a.permute(0, 2, 1, 3).reshape(B, T, n * d)))
         V = torch.stack(projected)                        # (L, B, T, d)
-        K = self.attn_res_norm(V)                         # (L, B, T, d)
-        logits = torch.einsum('d,lbtd->lbt', w_l, K)
-        alpha = logits.softmax(0)                         # (L, B, T)
-        return torch.einsum('lbt,lbtd->btd', alpha, V)   # (B, T, d)
+        K = self.attn_res_norm(V)
+        if w_l.dim() == 1:
+            logits = torch.einsum('d,lbtd->lbt', w_l, K)
+        else:                                             # (B, T, d) per-token
+            logits = torch.einsum('btd,lbtd->lbt', w_l, K)
+        alpha = logits.softmax(0)
+        return torch.einsum('lbt,lbtd->btd', alpha, V)
 
     def forward(self, x, kda_states=None):
         squeeze = (x.dim() == 2)
@@ -225,38 +465,73 @@ class KDAPolicyNetwork(nn.Module):
         n = self.n_mhc
         d = self.d
 
-        if kda_states is None:
-            kda_states = [None] * self.n_layers
+        kda_state = kda_states[0] if kda_states is not None else None
 
-        v0 = self.inp_proj(x)                           # (B, T, d)
-        stream = torch.zeros(B, n, T, d, device=x.device)
+        # Append learned [EOS] at the end
+        eos_emb = self.eos.view(1, 1, d).expand(B, 1, d)
+        v0 = self.inp_proj(x)
+        v0 = torch.cat([v0, eos_emb], dim=1)            # (B, T+1, d)
+        T_total = T + 1
+
+        stream = torch.zeros(B, n, T_total, d, device=x.device)
         stream[:, 0] = v0
 
         acc = [stream]
-        new_states = []
+        active = torch.ones(B, dtype=torch.bool, device=x.device)
+        exit_iter = torch.full((B,), float(self.max_iterations), device=x.device)
 
-        for l in range(self.n_layers):
-            # ── Attention ──
-            stream = self.stream_norms[l * 2](stream)
-            H_res, H_pre, H_post = self.mhc[l * 2](stream)
-            res_stream = torch.einsum('btij,bjtd->bitd', H_res, stream)
-            h = torch.einsum('btn,bntd->btd', H_pre, stream)
-            kda_out, S_final = self.kda_layers[l](h, S_init=kda_states[l])
-            new_states.append(S_final)
-            stream = res_stream + torch.einsum('btn,btd->bntd', H_post, kda_out)
+        for i in range(self.max_iterations):
+            # ── STE route ──
+            iter_t = torch.full((B,), i, dtype=torch.long, device=x.device)
+            logits = self.router(stream, iter_idx=iter_t)
+            ste, hard = _ste_route(logits)
 
-            # ── SwiGLU ──
-            stream = self.stream_norms[l * 2 + 1](stream)
-            H_res, H_pre, H_post = self.mhc[l * 2 + 1](stream)
-            res_stream = torch.einsum('btij,bjtd->bitd', H_res, stream)
-            h = torch.einsum('btn,bntd->btd', H_pre, stream)
-            out = self.swiglu_layers[l](h)
-            stream = res_stream + torch.einsum('btn,btd->bntd', H_post, out)
-            stream = stream + self._attn_res(acc, self.w[l], self.preH[l]).unsqueeze(1)
+            if i < self.min_iterations:
+                ste = active.float()
+                hard = torch.ones_like(hard)
+
+            gate = ste * active.float()
+            gate_4d = gate.view(B, 1, 1, 1)
+            gate_kda = gate.view(B, 1, 1)
+
+            # ── MoA Attention sub-layer ──
+            normed = self.stream_norms[0](stream)
+            attn_update, S_new = self.moa_kda(normed, S_init=kda_state)
+            updated = attn_update                            # replaces stream
+
+            # ── MoE SwiGLU sub-layer ──
+            normed2 = self.stream_norms[1](updated)
+            ffn_update, gate_moe = self.moe_swiglu(normed2)
+            updated = ffn_update
+
+            # Per-expert AttnRes (additive)
+            w_combined = torch.einsum('bte,ed->btd',
+                                      gate_moe, self.moe_swiglu.w_experts)
+            updated = updated + self._attn_res(
+                acc, w_combined, self.preH_iter).unsqueeze(1)
+
+            # ── Gate: active update, exited spin ──
+            stream = gate_4d * updated + (1 - gate_4d) * stream
+            if kda_state is not None:
+                kda_state = gate_kda * S_new + (1 - gate_kda) * kda_state
+            else:
+                kda_state = S_new
+
             acc.append(stream)
 
-        h_out = self._attn_res(acc, self.w[-1], self.preH[-1])
+            # ── Track exit iteration ──
+            hard_cont = (hard > 0.5)
+            newly_exited = active & (~hard_cont)
+            exit_iter = torch.where(newly_exited,
+                                    torch.tensor(float(i + 1), device=x.device),
+                                    exit_iter)
+            active = active & hard_cont
+            if not active.any():
+                break
+
+        new_kda_states = [kda_state]
+        h_out = self._attn_res(acc, self.w_final, self.preH_final)
         out = self.head_down(F.silu(self.head_gate(h_out)) * self.head_up(h_out))
         if squeeze:
             out = out.squeeze(0)
-        return out, new_states
+        return out, new_kda_states, exit_iter

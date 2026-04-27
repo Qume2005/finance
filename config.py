@@ -20,7 +20,7 @@ TEST_IDS  = list(range(N_TRAIN_SERIES, N_SERIES))
 EPISODE_LEN = 50
 G_SAMPLES   = 64
 LAMBDA_REWARD = 0.5          # 0=纯夏普率差值, 1=纯期末收益差值
-REWARD_SCALE = 50
+REWARD_SCALE = 20
 EPS_CLIP    = 0.2
 BETA_KL     = 0.0
 ENTROPY_COEFF = 0.0
@@ -32,3 +32,18 @@ BATCH_SIZE  = 16
 
 # Output
 OUTPUT_DIR = "output"
+
+# Dynamic loop
+MAX_ITERATIONS = 24
+MIN_ITERATIONS = 1
+ITER_REWARD_START = 1.0     # min_iterations 时的奖励系数
+ITER_REWARD_END   = 0.75     # max_iterations 时的奖励系数
+
+# MoA / MoE
+N_Q_EXPERTS   = 24         # MoA Q 投影专家数
+N_KV_EXPERTS  = 16         # MoA K/V 投影专家数
+N_FFN_EXPERTS = 24         # MoE 前馈专家数
+
+# 路由参数 (Q路由, KV路由, FFN路由)
+TOP_PROB = (0.4, 0.4, 0.4)
+MAX_K    = (3, 2, 3)
