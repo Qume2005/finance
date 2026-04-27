@@ -16,7 +16,7 @@ from config import TEST_IDS, OUTPUT_DIR, EPISODE_LEN
 # ────────────────── Backtest ──────────────────
 
 def backtest_series(policy, feats, rets, label=""):
-    """Run backtest with sliding window, parallelized via batch reshape."""
+    """Run backtest with sliding window, KDA warm-up, and parallelized batch reshape."""
     T = feats.shape[0] - 1                               # 可决策的时间步
     D = feats.shape[1]
     n_w = (T + EPISODE_LEN - 1) // EPISODE_LEN
@@ -26,17 +26,28 @@ def backtest_series(policy, feats, rets, label=""):
         if pad:
             f = torch.cat([f, f.new_zeros(pad, D)], dim=0)
 
+        # KDA 预热：前 EPISODE_LEN 步只积累状态
+        warmup = f[:EPISODE_LEN].unsqueeze(0)
+        _, kda_states = policy(warmup, kda_states=None)
+
+        # 预测：剩余步
+        pred_f = f[EPISODE_LEN:]
+        pred_T = pred_f.shape[0]
+        pred_n_w = (pred_T + EPISODE_LEN - 1) // EPISODE_LEN
+        pred_pad = pred_n_w * EPISODE_LEN - pred_T
+        if pred_pad:
+            pred_f = torch.cat([pred_f, pred_f.new_zeros(pred_pad, D)], dim=0)
+
         all_logits = []
-        kda_states = None
-        for w in range(n_w):
-            window = f[w * EPISODE_LEN:(w + 1) * EPISODE_LEN].unsqueeze(0)  # (1, EPISODE_LEN, D)
+        for w in range(pred_n_w):
+            window = pred_f[w * EPISODE_LEN:(w + 1) * EPISODE_LEN].unsqueeze(0)
             logits_w, kda_states = policy(window, kda_states=kda_states)
             all_logits.append(logits_w.squeeze(0))
 
-        logits = torch.cat(all_logits, dim=0)[:T]
+        logits = torch.cat(all_logits, dim=0)[:T - EPISODE_LEN]
         positions = logits.argmax(dim=-1)
 
-    rets_f = rets[1:]                                 # GPU
+    rets_f = rets[1 + EPISODE_LEN:]                   # GPU — aligned with post-warmup predictions
     pos_w = positions.float() / 10.0                  # GPU
 
     # strategy equity — all on GPU

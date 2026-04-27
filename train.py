@@ -99,7 +99,7 @@ def train_grpo(policy, ref_policy, train_feats, train_rets,
         r_batch = torch.stack([train_rets[idx.item()][1:T] for idx in indices])
         return f_batch, r_batch
 
-    def sliding_forward(model, feats):
+    def sliding_forward(model, feats, init_kda_states=None):
         """Sliding window forward with KDA state carryover across windows."""
         B, T, D = feats.shape
         n_w = (T + EPISODE_LEN - 1) // EPISODE_LEN
@@ -108,7 +108,7 @@ def train_grpo(policy, ref_policy, train_feats, train_rets,
             feats = torch.cat([feats, feats.new_zeros(B, pad, D)], dim=1)
 
         all_logits = []
-        kda_states = None
+        kda_states = init_kda_states
         for w in range(n_w):
             window = feats[:, w * EPISODE_LEN:(w + 1) * EPISODE_LEN, :]
             logits, kda_states = model(window, kda_states=kda_states)
@@ -116,7 +116,7 @@ def train_grpo(policy, ref_policy, train_feats, train_rets,
                 kda_states = [s.detach() for s in kda_states]
             all_logits.append(logits)
 
-        return torch.cat(all_logits, dim=1)[:, :T, :]
+        return torch.cat(all_logits, dim=1)[:, :T, :], kda_states
 
     def grpo_step():
         feats, rets = sample_series_batch()          # (B, SEQ_LEN, 14), (B, SEQ_LEN)
@@ -133,36 +133,47 @@ def train_grpo(policy, ref_policy, train_feats, train_rets,
             muon_opt._hooks = []
             muon_opt.update_preconditioner()
 
-        # Pre-compute BH baseline metrics once (same for all G samples)
-        bh_sharpe, bh_return = compute_bh_metrics(rets)              # (B,)
+        # KDA 预热：前 EPISODE_LEN 步只积累状态，不预测
+        with torch.no_grad():
+            _, policy_warmup = sliding_forward(policy, feats[:, :EPISODE_LEN, :])
+            _, ref_warmup = sliding_forward(ref_policy, feats[:, :EPISODE_LEN, :])
 
-        # sliding window forward
-        logits = sliding_forward(policy, feats)                 # (B, SEQ_LEN, 11)
+        # 预热后的特征和收益
+        pred_feats = feats[:, EPISODE_LEN:, :]                    # (B, SEQ_LEN-50, 14)
+        pred_rets = rets[:, EPISODE_LEN:]                          # (B, SEQ_LEN-50)
+
+        # Pre-compute BH baseline metrics once (same for all G samples)
+        bh_sharpe, bh_return = compute_bh_metrics(pred_rets)       # (B,)
+
+        # sliding window forward (with warm-up KDA states)
+        logits, _ = sliding_forward(policy, pred_feats,
+                                     init_kda_states=policy_warmup)
 
         # float32 log_softmax — avoids -inf in fp16 causing zero-prob Categorical
         log_probs = F.log_softmax(logits.float(), dim=-1)
 
         with torch.no_grad():
             old_log_probs = log_probs.detach()
-            dist_cat = Categorical(logits=old_log_probs)        # (B, SEQ_LEN, 11)
-            actions = dist_cat.sample((G_SAMPLES,))             # (G, B, SEQ_LEN)
+            dist_cat = Categorical(logits=old_log_probs)
+            actions = dist_cat.sample((G_SAMPLES,))                 # (G, B, SEQ_LEN-50)
             old_lp = old_log_probs.unsqueeze(0).expand(G_SAMPLES, -1, -1, -1) \
                                 .gather(3, actions.unsqueeze(3)).squeeze(3)
-            rw = compute_rewards(actions, rets, bh_sharpe, bh_return)
+            rw = compute_rewards(actions, pred_rets, bh_sharpe, bh_return)
 
         adv = rw.detach()
 
         cur_lp = log_probs.unsqueeze(0).expand(G_SAMPLES, -1, -1, -1) \
                           .gather(3, actions.unsqueeze(3)).squeeze(3)
-        ratio = (cur_lp - old_lp).exp()                        # (G, B, SEQ_LEN)
-        adv_exp = adv.unsqueeze(2)                              # (G, B, 1)
+        ratio = (cur_lp - old_lp).exp()
+        adv_exp = adv.unsqueeze(2)
         surr1 = ratio * adv_exp
         surr2 = ratio.clamp(1 - EPS_CLIP, 1 + EPS_CLIP) * adv_exp
         loss_clip = -torch.min(surr1, surr2).mean()
 
-        # KL(π_ref || π_θ) — 同样滑动窗口
+        # KL(π_ref || π_θ)
         with torch.no_grad():
-            ref_logits = sliding_forward(ref_policy, feats)
+            ref_logits, _ = sliding_forward(ref_policy, pred_feats,
+                                             init_kda_states=ref_warmup)
             ref_lp = F.log_softmax(ref_logits.float(), dim=-1)
             ref_p  = ref_lp.exp()
         kl = (ref_p * (ref_lp - log_probs)).sum(dim=-1).mean()
