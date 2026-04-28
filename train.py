@@ -102,33 +102,28 @@ def train_grpo(policy, ref_policy, train_feats, train_rets,
         return f_batch, r_batch
 
     def sliding_forward(model, feats, init_kda_states=None):
-        """Sliding window forward with KDA state carryover across windows."""
+        """Parallel window forward — all windows as one batch."""
         B, T, D = feats.shape
         n_w = (T + EPISODE_LEN - 1) // EPISODE_LEN
         pad = n_w * EPISODE_LEN - T
         if pad:
             feats = torch.cat([feats, feats.new_zeros(B, pad, D)], dim=1)
 
-        all_logits = []
-        all_exit_iters = []
-        kda_states = init_kda_states
-        for w in range(n_w):
-            window = feats[:, w * EPISODE_LEN:(w + 1) * EPISODE_LEN, :]
-            logits, kda_states, exit_iter = model(window, kda_states=kda_states)
-            if model.training:
-                kda_states = [s.detach() for s in kda_states]
-            # 中间窗口去掉 EOS，最后一个窗口保留 EOS
-            if w < n_w - 1:
-                all_logits.append(logits[:, :-1, :])
-            else:
-                all_logits.append(logits)
-            all_exit_iters.append(exit_iter)               # (B,) per window
+        # (B, n_w*EPISODE_LEN, D) → (B*n_w, EPISODE_LEN, D)
+        windows = feats.reshape(B * n_w, EPISODE_LEN, D)
 
-        total = torch.cat(all_logits, dim=1)
-        # 取前 T 步（真实预测）+ 最后 1 步（EOS）= T+1
-        # exit_iter: 取最后一个窗口的（代表最终退出深度）
-        return (torch.cat([total[:, :T, :], total[:, -1:, :]], dim=1),
-                kda_states, all_exit_iters[-1])
+        logits, kda_states, exit_iters = model(windows, kda_states=None)
+
+        # logits: (B*n_w, EPISODE_LEN+1, n_actions)
+        logits_4d = logits.reshape(B, n_w, EPISODE_LEN + 1, -1)
+
+        # 所有窗口去掉 EOS，拼起来；最后补上最后一个窗口的 EOS
+        non_eos = logits_4d[:, :, :-1, :].reshape(B, n_w * EPISODE_LEN, -1)
+        last_eos = logits_4d[:, -1, -1:, :]
+        result = torch.cat([non_eos[:, :T, :], last_eos], dim=1)  # (B, T+1, n_actions)
+
+        exit_last = exit_iters.reshape(B, n_w)[:, -1]
+        return result, kda_states, exit_last
 
     def grpo_step():
         feats, rets = sample_series_batch()          # (B, SEQ_LEN, 14), (B, SEQ_LEN)
@@ -145,21 +140,15 @@ def train_grpo(policy, ref_policy, train_feats, train_rets,
             muon_opt._hooks = []
             muon_opt.update_preconditioner()
 
-        # KDA 预热：前 EPISODE_LEN 步只积累状态，不预测
-        with torch.no_grad():
-            _, policy_warmup, _ = sliding_forward(policy, feats[:, :EPISODE_LEN, :])
-            _, ref_warmup, _ = sliding_forward(ref_policy, feats[:, :EPISODE_LEN, :])
-
-        # 预热后的特征和收益
+        # 全序列并行 forward（无 KDA 状态传递）
         pred_feats = feats[:, EPISODE_LEN:, :]                    # (B, SEQ_LEN-50, 14)
         pred_rets = rets[:, EPISODE_LEN:]                          # (B, SEQ_LEN-50)
 
         # Pre-compute BH baseline metrics once (same for all G samples)
         bh_sharpe, bh_return = compute_bh_metrics(pred_rets)       # (B,)
 
-        # sliding window forward (with warm-up KDA states)
-        logits, _, exit_iters = sliding_forward(policy, pred_feats,
-                                                init_kda_states=policy_warmup)
+        # parallel window forward
+        logits, _, exit_iters = sliding_forward(policy, pred_feats)
 
         # logits: (B, T+1, 11) — T real steps + 1 EOS
         T_real = pred_rets.shape[1]
@@ -199,8 +188,7 @@ def train_grpo(policy, ref_policy, train_feats, train_rets,
 
         # KL(π_ref || π_θ) — includes EOS
         with torch.no_grad():
-            ref_logits, _, _ = sliding_forward(ref_policy, pred_feats,
-                                                init_kda_states=ref_warmup)
+            ref_logits, _, _ = sliding_forward(ref_policy, pred_feats)
             ref_lp = F.log_softmax(ref_logits.float(), dim=-1)
             ref_p  = ref_lp.exp()
         kl = (ref_p * (ref_lp - log_probs)).sum(dim=-1).mean()
