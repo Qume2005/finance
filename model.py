@@ -75,6 +75,45 @@ class MHC(nn.Module):
         return H_res, H_pre, H_post
 
 
+# ────────────────── S-MHC (state mixing) ──────────────────
+
+class S_MHC(nn.Module):
+    """mHC for KDA state matrix S — operates on S magnitude (phase-free)."""
+    def __init__(self, d_key, d_value, n=4):
+        super().__init__()
+        self.n = n
+        self.dk = d_key
+        nd = n * d_value
+        self.norm = nn.RMSNorm(nd)
+        self.phi_pre  = nn.Linear(nd, n, bias=False)
+        self.phi_post = nn.Linear(nd, n, bias=False)
+        self.phi_res  = nn.Linear(nd, n * n, bias=False)
+        self.b_pre  = nn.Parameter(torch.zeros(n))
+        self.b_post = nn.Parameter(torch.zeros(n))
+        self.b_res  = nn.Parameter(torch.zeros(n, n))
+        self.alpha_pre  = nn.Parameter(torch.tensor(0.01))
+        self.alpha_post = nn.Parameter(torch.tensor(0.01))
+        self.alpha_res  = nn.Parameter(torch.tensor(0.01))
+
+    def forward(self, S_stack):
+        """
+        S_stack: (B, n, dk_pope, dv) — full state with PoPE phase
+        Returns: H_res(B,n,n), H_pre(B,n), H_post(B,n)
+        """
+        B, n, dk2, dv = S_stack.shape
+        dk = dk2 // 2
+        # 幅度提取（消除相位）
+        mag = (S_stack[:, :, :dk, :]**2 + S_stack[:, :, dk:, :]**2).mean(dim=2)  # (B, n, dv)
+        x = self.norm(mag.reshape(B, n * dv))              # (B, n*dv)
+
+        H_pre  = torch.sigmoid(self.alpha_pre * self.phi_pre(x) + self.b_pre)
+        H_post = 2 * torch.sigmoid(self.alpha_post * self.phi_post(x) + self.b_post)
+        H_res_raw = self.alpha_res * self.phi_res(x).reshape(B, self.n, self.n) + self.b_res
+        H_res = sinkhorn_knopp(H_res_raw)
+
+        return H_res, H_pre, H_post
+
+
 # ────────────────── Compiled KDA step ──────────────────
 
 @torch.compile
@@ -95,7 +134,7 @@ def _kda_step(q_t, k_t, v_t, alpha_t, beta_t, S):
 class MoAKDALayer(nn.Module):
     """
     Multi-Head MoA-KDA: H heads, each with separate Q expert pool and KV expert pool.
-    Expert 0 = zero/no-op in each pool. Per-head top-1 routing.
+    Q expert 0 = zero/no-op; all KV experts are active. Per-head top-1 routing.
     Per-head KDA, concat heads → preGate(KV) → W_o → postGate(Q).
     """
     def __init__(self, d_input, d_key=16, d_value=16,
@@ -133,7 +172,7 @@ class MoAKDALayer(nn.Module):
         self.mhc_q  = nn.ModuleList([MHC(d_input, n_mhc) for _ in range(HQ)])
         self.norm_q = nn.ModuleList([nn.RMSNorm(d_input) for _ in range(HQ)])
 
-        # ── KV expert params (flat: idx = h*Ek + e) — expert 0 = zero ──
+        # ── KV expert params (flat: idx = h*Ek + e) — all active ──
         HK = n_heads * n_kv_experts_per_head
         self.lora_A_k = nn.Parameter(torch.randn(HK, d_input, r) * 0.01)
         self.lora_B_k = nn.Parameter(torch.zeros(HK, r, d_key))
@@ -148,6 +187,9 @@ class MoAKDALayer(nn.Module):
 
         self.mhc_kv  = nn.ModuleList([MHC(d_input, n_mhc) for _ in range(HK)])
         self.norm_kv = nn.ModuleList([nn.RMSNorm(d_input) for _ in range(HK)])
+
+        # ── S-MHC: per-head state stream mixing ──
+        self.s_mhc = nn.ModuleList([S_MHC(d_key, d_value, n_mhc) for _ in range(n_heads)])
 
         # ── Output path: preGate(KV) → W_o → postGate(Q) ──
         concat_dim = n_heads * d_value                    # H * dv
@@ -167,21 +209,43 @@ class MoAKDALayer(nn.Module):
         return torch.cat([real, imag], dim=-1)
 
     @torch.compiler.disable
-    def _kda_recursion(self, q, k, v, alpha, beta, T, S_init=None):
+    def _kda_recursion(self, q, k, v, alpha, beta, T, S_init=None, s_mhc=None):
         B = q.shape[0]
-        S = S_init if S_init is not None else q.new_zeros(B, self.dk_pope, self.dv)
+        n = self.n_mhc
+
+        # S_init: (B, n, dk_pope, dv) or None
+        if S_init is not None:
+            S_stack = S_init                                  # (B, n, dk_pope, dv)
+        else:
+            S_stack = q.new_zeros(B, n, self.dk_pope, self.dv)
+
+        # mHC 混合矩阵（每窗口算一次）
+        H_res, H_pre, H_post = s_mhc(S_stack)                # (B,n,n), (B,n), (B,n)
+
         out = q.new_empty(B, T, self.dv)
         for t in range(T):
-            out[:, t], S = _kda_step(q[:, t], k[:, t], v[:, t],
-                                     alpha[:, t], beta[:, t], S)
-        return out, S
+            # 聚合 n 流 → 单个 s
+            s = torch.einsum('bi,bide->bde', H_pre, S_stack)  # (B, dk_pope, dv)
+
+            # Delta Rule（_kda_step 不变）
+            attn_out, s_new = _kda_step(q[:, t], k[:, t], v[:, t],
+                                        alpha[:, t], beta[:, t], s)
+
+            # 残差 + 分发
+            delta = s_new - s                                  # (B, dk_pope, dv)
+            S_stack = (torch.einsum('bij,bjde->bide', H_res, S_stack)
+                       + torch.einsum('bi,bde->bide', H_post, delta))
+
+            out[:, t] = attn_out
+
+        return out, S_stack
 
     @torch.compiler.disable
     def forward(self, stream, S_init=None):
         """
         stream: (B, n_mhc, T, d)
-        S_init: list[H] of (B, dk_pope, dv) or None
-        Returns: stream_update (B, n_mhc, T, d), S_new list[H]
+        S_init: list[H] of (B, n, dk_pope, dv) or None
+        Returns: stream_update (B, n_mhc, T, d), S_new list[H] of (B, n, dk_pope, dv)
         """
         B, n, T, d = stream.shape
         H, Eq, Ek = self.H, self.Eq, self.Ek
@@ -211,7 +275,6 @@ class MoAKDALayer(nn.Module):
             kv_coeff = kv_probs.gather(-1, kv_sel.unsqueeze(-1)).squeeze(-1)
 
             q_zero = (q_sel == 0)
-            kv_zero = (kv_sel == 0)
 
             # ── Phase 1a: Q experts → accumulate q ──
             q_h = stream.new_zeros(B, T, self.dk_pope)
@@ -253,7 +316,7 @@ class MoAKDALayer(nn.Module):
             head_kv_Hpost = []
             head_kv_mask = []
 
-            for e in range(1, Ek):
+            for e in range(Ek):
                 mask_e = (kv_sel == e)
                 if not mask_e.any():
                     head_kv_Hres.append(None)
@@ -290,14 +353,12 @@ class MoAKDALayer(nn.Module):
                 head_kv_Hpost.append(H_post)
                 head_kv_mask.append(mask_e)
 
-            # ── Zero expert: KV zero → preserve S; Q zero → output 0 ──
-            alpha_h[kv_zero] = 1.0
-            beta_h[kv_zero] = 0.0
+            # ── Q zero expert → output 0 ──
 
             # ── Per-head KDA ──
             S_h_init = S_init[h] if S_init is not None else None
             out_h, S_h_new = self._kda_recursion(
-                q_h, k_h, v_h, alpha_h, beta_h, T, S_h_init)
+                q_h, k_h, v_h, alpha_h, beta_h, T, S_h_init, s_mhc=self.s_mhc[h])
 
             # Scale by Q coefficient; zero out Q-zero tokens
             out_h = out_h * q_coeff.unsqueeze(-1)
@@ -556,7 +617,7 @@ class KDAPolicyNetwork(nn.Module):
 
             gate = ste * active.float()
             gate_4d = gate.view(B, 1, 1, 1)
-            gate_kda = gate.view(B, 1, 1)
+            gate_kda = gate.view(B, 1, 1, 1)
 
             # MoA Attention (returns list[H] of S matrices)
             attn_update, S_new_list = self.moa_kda(stream, S_init=kda_states)
@@ -608,7 +669,7 @@ class KDAPolicyNetwork(nn.Module):
         n = self.n_mhc
         d = self.d
 
-        # kda_states: list[H] of (B, dk_pope, dv) or None
+        # kda_states: list[H] of (B, n, dk_pope, dv) or None
         # _loop expects same format
 
         # Append learned [EOS] at the end
