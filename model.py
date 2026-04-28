@@ -90,9 +90,8 @@ def _kda_step(q_t, k_t, v_t, alpha_t, beta_t, S):
 
 class MoAKDALayer(nn.Module):
     """
-    MoA-KDA: shared base W_q/W_k/W_v + per-expert LoRA + per-expert mHC/gates.
-    Q experts and KV experts have separate counts.
-    Single KDA pass with combined projections.
+    MoA-KDA: shared base W_q/W_k/W_v + per-expert LoRA + per-expert mHC.
+    Per-KV-expert KDA → concat heads → preGate(KV) → W_o → postGate(Q).
     """
     def __init__(self, d_input, d_key=16, d_value=16,
                  n_q_experts=16, n_kv_experts=16, n_mhc=4,
@@ -115,15 +114,13 @@ class MoAKDALayer(nn.Module):
         self.W_k = nn.Linear(d_input, d_key, bias=False)
         self.W_v = nn.Linear(d_input, d_value, bias=False)
         self.pope_delta_raw = nn.Parameter(torch.zeros(d_key))
-        self.W_out = nn.Linear(d_value, d_input, bias=False)
 
-        # ── Q-expert params (LoRA_q + mHC + post_norm) ──
+        # ── Q-expert params (LoRA_q + mHC) ──
         self.lora_A_q = nn.Parameter(torch.randn(n_q_experts, d_input, r) * 0.01)
         self.lora_B_q = nn.Parameter(torch.zeros(n_q_experts, r, d_key))
         self.mhc_q    = nn.ModuleList([MHC(d_input, n_mhc) for _ in range(n_q_experts)])
-        self.post_norm_q = nn.ModuleList([nn.RMSNorm(d_value) for _ in range(n_q_experts)])
 
-        # ── KV-expert params (LoRA_k/v + alpha/beta + mHC + post_norm + W_d/W_u) ──
+        # ── KV-expert params (LoRA_k/v + alpha/beta + mHC) ──
         self.lora_A_k = nn.Parameter(torch.randn(n_kv_experts, d_input, r) * 0.01)
         self.lora_B_k = nn.Parameter(torch.zeros(n_kv_experts, r, d_key))
         self.lora_A_v = nn.Parameter(torch.randn(n_kv_experts, d_input, r) * 0.01)
@@ -136,10 +133,14 @@ class MoAKDALayer(nn.Module):
         self.beta_down_w  = nn.Parameter(torch.randn(n_kv_experts, d_alpha, 1) * 0.01)
 
         self.mhc_kv      = nn.ModuleList([MHC(d_input, n_mhc) for _ in range(n_kv_experts)])
-        self.post_norm_kv = nn.ModuleList([nn.RMSNorm(d_value) for _ in range(n_kv_experts)])
-        d_d = int(d_value / 1.618)
-        self.W_d_kv = nn.Parameter(torch.randn(n_kv_experts, d_input, d_d) * 0.01)
-        self.W_u_kv = nn.Parameter(torch.randn(n_kv_experts, d_d, d_input) * 0.01)
+
+        # ── Output path: preGate(KV) → W_o → postGate(Q) ──
+        concat_dim = n_kv_experts * d_value              # Ek * dv
+        self.W_pre = nn.Linear(d_input, concat_dim, bias=False)
+        self.W_o   = nn.Linear(concat_dim, d_input, bias=False)
+        d_pg = int(concat_dim * 0.618)
+        self.W_pg1 = nn.Linear(d_input, d_pg, bias=False)
+        self.W_pg2 = nn.Linear(d_pg, d_input, bias=False)
 
         # ── Routers ──
         self.router_q  = nn.Linear(d_input, n_q_experts, bias=False)
@@ -201,6 +202,11 @@ class MoAKDALayer(nn.Module):
             g = gate_q[:, :, e].unsqueeze(-1)            # (B, T, 1)
             q_total += g * q_e
 
+        # h_q_routed → postGate input (Q-bound)
+        h_q_routed = (torch.stack(h_q_list)                  # (Eq, B, T, d)
+                      * gate_q.permute(2, 0, 1).unsqueeze(-1)
+                      ).sum(dim=0)                            # (B, T, d)
+
         # ── Phase 1b: KV-experts → accumulate weighted k/v/alpha/beta ──
         k_total     = normed_stream.new_zeros(B, T, self.dk_pope)
         v_total     = normed_stream.new_zeros(B, T, self.dv)
@@ -235,32 +241,42 @@ class MoAKDALayer(nn.Module):
             alpha_total += g * alpha_e
             beta_total  += g * beta_e
 
-        # ── Phase 2: single KDA pass ──
+        # h_kv_routed → preGate input (KV-bound)
+        h_kv_routed = (torch.stack(h_kv_list)                # (Ek, B, T, d)
+                       * gate_kv.permute(2, 0, 1).unsqueeze(-1)
+                       ).sum(dim=0)                           # (B, T, d)
+
+        # ── Phase 2: single KDA pass (Delta Rule unchanged) ──
         out, S_new = self._kda_recursion(
             q_total, k_total, v_total, alpha_total, beta_total, T, S_init)
 
-        # ── Phase 3a: Q-expert post-processing ──
-        stream_update = normed_stream.new_zeros(B, n, T, d)
-        for e in range(Eq):
-            out_e = self.post_norm_q[e](out)
-            out_e = self.W_out(out_e)
+        # ── Phase 3: preGate(KV) → W_o → postGate(Q) → mHC stream mixing ──
+        # heads: gate_kv-weighted copies of KDA output, each expert a "head"
+        heads = (out.unsqueeze(-2) * gate_kv.unsqueeze(-1)).reshape(
+            B, T, Ek * self.dv)                              # (B, T, Ek*dv)
 
+        pre_gate = F.silu(self.W_pre(h_kv_routed))          # (B, T, Ek*dv)
+        gated = heads * pre_gate
+
+        proj = self.W_o(gated)                               # (B, T, d)
+
+        post_gate = torch.sigmoid(
+            self.W_pg2(F.silu(self.W_pg1(h_q_routed))))     # (B, T, d)
+        result = proj * post_gate                            # (B, T, d)
+
+        # mHC stream mixing: H_res residual + H_post output
+        stream_update = normed_stream.new_zeros(B, n, T, d)
+
+        for e in range(Eq):
             g = gate_q[:, :, e].view(B, 1, T, 1)
             res = torch.einsum('btij,bjtd->bitd', H_res_q[e], normed_stream)
-            post = torch.einsum('btn,btd->bntd', H_post_q[e], out_e)
+            post = torch.einsum('btn,btd->bntd', H_post_q[e], result)
             stream_update += g * (res + post)
 
-        # ── Phase 3b: KV-expert post-processing ──
         for e in range(Ek):
-            out_e = self.post_norm_kv[e](out)
-            out_e = self.W_out(out_e)
-            gate_e = torch.sigmoid(
-                F.silu(h_kv_list[e] @ self.W_d_kv[e]) @ self.W_u_kv[e])
-            out_e = gate_e * out_e
-
             g = gate_kv[:, :, e].view(B, 1, T, 1)
             res = torch.einsum('btij,bjtd->bitd', H_res_kv[e], normed_stream)
-            post = torch.einsum('btn,btd->bntd', H_post_kv[e], out_e)
+            post = torch.einsum('btn,btd->bntd', H_post_kv[e], result)
             stream_update += g * (res + post)
 
         return stream_update, S_new
@@ -302,7 +318,7 @@ class MoESwiGLU(nn.Module):
         self.experts = nn.ModuleList([SwiGLU(d_hidden) for _ in range(n_experts)])
         self.mhc_swiglu = nn.ModuleList([MHC(d_hidden, n_mhc) for _ in range(n_experts)])
         self.expert_router = nn.Linear(d_hidden, n_experts, bias=False)
-        self.w_experts = nn.Parameter(torch.zeros(n_experts, d_hidden))
+        self.w_experts = nn.Parameter(torch.randn(n_experts, d_hidden) * 0.01)
 
     def forward(self, normed_stream):
         """
@@ -430,8 +446,8 @@ class KDAPolicyNetwork(nn.Module):
     def _init_weights(self):
         depth = self.max_iterations * 2
         scale = depth ** -0.5
-        nn.init.normal_(self.moa_kda.W_out.weight,
-                        std=scale * (2.0 / self.moa_kda.W_out.in_features) ** 0.5)
+        nn.init.normal_(self.moa_kda.W_o.weight,
+                        std=scale * (2.0 / self.moa_kda.W_o.in_features) ** 0.5)
         for expert in self.moe_swiglu.experts:
             nn.init.normal_(expert.down.weight,
                             std=scale * (2.0 / expert.down.in_features) ** 0.5)
