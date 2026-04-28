@@ -207,19 +207,19 @@ def train_grpo(policy, ref_policy, train_feats, train_rets,
 
         entropy = -(log_probs.exp() * log_probs).sum(dim=-1).mean()
 
-        # 路由器行向量正交正则
+        # 路由器行向量正交正则: mean(<w_i,w_j>^2) × (d/E)
         if ORTHO_COEFF > 0:
             ortho_loss = torch.tensor(0.0, device=feats.device)
-            for router in [raw_model.moa_kda.router_q,
-                           raw_model.moa_kda.router_kv,
+            for router in [*raw_model.moa_kda.q_routers,
+                           *raw_model.moa_kda.kv_routers,
                            raw_model.moe_swiglu.expert_router,
-                           raw_model.router.proj]:                   # halting STE
-                W = F.normalize(router.weight, dim=1)               # (E, d) 按行归一
-                E = W.shape[0]
-                G = W @ W.T                                         # (E, E)
-                mask = ~torch.eye(E, dtype=torch.bool, device=G.device)
-                dot_sum = G[mask].sum()                             # 两两点乘之和
-                ortho_loss = ortho_loss + dot_sum.pow(2) / E
+                           raw_model.router.proj]:
+                W = router.weight                                   # (E, d)
+                E, d = W.shape
+                G = W @ W.T                                         # (E, E) 两两点乘
+                idx = torch.triu_indices(E, E, offset=1, device=G.device)
+                pairs = G[idx[0], idx[1]]                           # (C,), C = E*(E-1)/2
+                ortho_loss = ortho_loss + pairs.pow(2).mean() * (d / E) / 2
             ortho_loss = ORTHO_COEFF * ortho_loss
         else:
             ortho_loss = torch.tensor(0.0, device=feats.device)

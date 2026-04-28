@@ -63,13 +63,20 @@ def create_models(device, is_main, world_size, local_rank):
     for p in ref_policy.parameters():
         p.requires_grad = False
 
-    # torch.compile: only single-GPU (DDP + compile has in-place tensor version conflicts)
-    # _kda_step is always compiled regardless (module-level @torch.compile)
+    # torch.compile: only compile modules without Python loops
+    # _kda_step: module-level @torch.compile
+    # MoAKDALayer.forward, MoESwiGLU.forward, _loop, _attn_res: @torch.compiler.disable
+    # MoAKDALayer internal Linears: NOT compiled (different shapes cause recompile,
+    #   and they run inside disabled forward anyway)
     if world_size == 1:
-        policy = torch.compile(raw_policy)
-        ref_policy = torch.compile(ref_policy)
-    else:
-        policy = raw_policy
+        raw_policy.router = torch.compile(raw_policy.router)
+        raw_policy._head = torch.compile(raw_policy._head)
+        raw_policy.inp_proj = torch.compile(raw_policy.inp_proj)
+        ref_policy.router = torch.compile(ref_policy.router)
+        ref_policy._head = torch.compile(ref_policy._head)
+        ref_policy.inp_proj = torch.compile(ref_policy.inp_proj)
+
+    policy = raw_policy
 
     if is_main:
         n_params = sum(p.numel() for p in raw_policy.parameters())

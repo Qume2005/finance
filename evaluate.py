@@ -39,13 +39,20 @@ def backtest_series(policy, feats, rets, label=""):
             pred_f = torch.cat([pred_f, pred_f.new_zeros(pred_pad, D)], dim=0)
 
         all_logits = []
+        all_exit_iters = []
         for w in range(pred_n_w):
             window = pred_f[w * EPISODE_LEN:(w + 1) * EPISODE_LEN].unsqueeze(0)
-            logits_w, kda_states, _ = policy(window, kda_states=kda_states)
+            logits_w, kda_states, exit_iter_w = policy(window, kda_states=kda_states)
             all_logits.append(logits_w.squeeze(0)[:-1, :])   # strip EOS
+            # exit_iter_w: (1,) → expand to window length
+            n_valid = min(EPISODE_LEN, T - EPISODE_LEN - w * EPISODE_LEN)
+            all_exit_iters.append(exit_iter_w.squeeze(0).item())
 
         logits = torch.cat(all_logits, dim=0)[:T - EPISODE_LEN]
         positions = logits.argmax(dim=-1)
+
+        # Per-window exit iteration depth → broadcast to per-token
+        exit_iters = np.repeat(all_exit_iters, EPISODE_LEN)[:T - EPISODE_LEN]
 
     rets_f = rets[1 + EPISODE_LEN:]                   # GPU — aligned with post-warmup predictions
     pos_w = positions.float() / 10.0                  # GPU
@@ -93,6 +100,7 @@ def backtest_series(policy, feats, rets, label=""):
     return {
         "metrics": metrics,
         "positions": positions.cpu().numpy(),
+        "exit_iters": exit_iters,
         "strat_eq": strat_eq.cpu().numpy(),
         "bh_eq": bh_eq.cpu().numpy(),
         "strat_dd": strat_dd.cpu().numpy(),
@@ -168,6 +176,7 @@ def export_results(results, history, test_ids=None, output_dir=None):
         df = pd.DataFrame({
             "day": np.arange(len(r["strat_eq"])),
             "position": r["positions"],
+            "loop_depth": r["exit_iters"] if "exit_iters" in r else np.nan,
             "daily_return": r["rets"],
             "strat_equity": r["strat_eq"],
             "bh_equity": r["bh_eq"],
@@ -249,8 +258,8 @@ def plot_results(results, test_ids=None, output_dir=None):
         T = len(r["strat_eq"])
         days = np.arange(T)
 
-        fig, axes = plt.subplots(3, 1, figsize=(14, 9), sharex=True,
-                                 gridspec_kw={"height_ratios": [3, 3, 1]})
+        fig, axes = plt.subplots(4, 1, figsize=(14, 11), sharex=True,
+                                 gridspec_kw={"height_ratios": [3, 3, 1, 1]})
 
         # 1) Equity curves
         axes[0].plot(days, r["bh_eq"],    lw=1, alpha=.6, label="Buy & Hold", color="gray")
@@ -269,8 +278,15 @@ def plot_results(results, test_ids=None, output_dir=None):
         axes[2].imshow(r["positions"].reshape(1, -1), aspect="auto",
                        cmap="RdYlGn", vmin=0, vmax=10, interpolation="nearest")
         axes[2].set_ylabel("Position")
-        axes[2].set_xlabel("Trading Day")
         axes[2].set_yticks([])
+
+        # 4) Loop depth (exit iteration per token)
+        if "exit_iters" in r:
+            exit_days = np.arange(len(r["exit_iters"]))
+            axes[3].fill_between(exit_days, r["exit_iters"], alpha=.6, color="tab:orange")
+            axes[3].set_ylabel("Loop Depth")
+            axes[3].set_xlabel("Trading Day")
+            axes[3].set_ylim(bottom=0)
 
         plt.tight_layout()
         _save_fig(fig, f"fig_03_test_series_{sid}.png", output_dir)
