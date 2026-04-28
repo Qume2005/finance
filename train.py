@@ -92,16 +92,16 @@ def train_grpo(policy, ref_policy, train_feats, train_rets,
                 sch.step()
 
     def sample_series_batch():
-        """Sample full training series (feats[:-1] → rets[1:] alignment)."""
+        """Sample full training series from CPU, transfer to GPU."""
         T = train_feats[0].shape[0]
         seq_len = T - 1
         n_series = len(train_feats)
         indices = torch.randint(n_series, (BATCH_SIZE,))
-        f_batch = torch.stack([train_feats[idx.item()][:seq_len] for idx in indices])
-        r_batch = torch.stack([train_rets[idx.item()][1:T] for idx in indices])
+        f_batch = torch.stack([train_feats[idx.item()][:seq_len] for idx in indices]).to(rank, non_blocking=True)
+        r_batch = torch.stack([train_rets[idx.item()][1:T] for idx in indices]).to(rank, non_blocking=True)
         return f_batch, r_batch
 
-    def sliding_forward(model, feats, init_kda_states=None):
+    def sliding_forward(model, feats):
         """Parallel window forward — all windows as one batch."""
         B, T, D = feats.shape
         n_w = (T + EPISODE_LEN - 1) // EPISODE_LEN
@@ -112,7 +112,7 @@ def train_grpo(policy, ref_policy, train_feats, train_rets,
         # (B, n_w*EPISODE_LEN, D) → (B*n_w, EPISODE_LEN, D)
         windows = feats.reshape(B * n_w, EPISODE_LEN, D)
 
-        logits, kda_states, exit_iters = model(windows, kda_states=None)
+        logits, exit_iters = model(windows)
 
         # logits: (B*n_w, EPISODE_LEN+1, n_actions)
         logits_4d = logits.reshape(B, n_w, EPISODE_LEN + 1, -1)
@@ -122,13 +122,12 @@ def train_grpo(policy, ref_policy, train_feats, train_rets,
         last_eos = logits_4d[:, -1, -1:, :]
         result = torch.cat([non_eos[:, :T, :], last_eos], dim=1)  # (B, T+1, n_actions)
 
-        exit_last = exit_iters.reshape(B, n_w)[:, -1]
-        return result, kda_states, exit_last
+        exit_avg = exit_iters.reshape(B, n_w).float().mean(dim=-1)
+        return result, exit_avg
 
     def grpo_step():
-        feats, rets = sample_series_batch()          # (B, SEQ_LEN, 14), (B, SEQ_LEN)
-
-        # Newton-Muon: refresh preconditioner periodically
+        feats, rets = sample_series_batch()
+        torch.cuda.current_stream(rank).synchronize()
         _global_step[0] += 1
         if _global_step[0] % muon_opt.refresh_interval == 0:
             # Temporarily register hooks → eager forward → collect ZZ^T → remove hooks
@@ -141,42 +140,36 @@ def train_grpo(policy, ref_policy, train_feats, train_rets,
             muon_opt.update_preconditioner()
 
         # 全序列并行 forward（无 KDA 状态传递）
-        pred_feats = feats[:, EPISODE_LEN:, :]                    # (B, SEQ_LEN-50, 14)
-        pred_rets = rets[:, EPISODE_LEN:]                          # (B, SEQ_LEN-50)
+        bh_sharpe, bh_return = compute_bh_metrics(rets)            # (B,)
 
-        # Pre-compute BH baseline metrics once (same for all G samples)
-        bh_sharpe, bh_return = compute_bh_metrics(pred_rets)       # (B,)
-
-        # parallel window forward
-        logits, _, exit_iters = sliding_forward(policy, pred_feats)
-
-        # logits: (B, T+1, 11) — T real steps + 1 EOS
-        T_real = pred_rets.shape[1]
-
-        # float32 log_softmax — avoids -inf in fp16 causing zero-prob Categorical
-        log_probs = F.log_softmax(logits.float(), dim=-1)
-        log_probs_real = log_probs[:, :T_real, :]            # (B, T, 11) for action/reward
-
+        # parallel window forward — 采样阶段
         with torch.no_grad():
-            old_log_probs = log_probs_real.detach()
-            dist_cat = Categorical(logits=old_log_probs)
-            actions = dist_cat.sample((G_SAMPLES,))                 # (G, B, T)
-            old_lp = old_log_probs.unsqueeze(0).expand(G_SAMPLES, -1, -1, -1) \
-                                .gather(3, actions.unsqueeze(3)).squeeze(3)
-            rw = compute_rewards(actions, pred_rets, bh_sharpe, bh_return)
+            logits, exit_iters = sliding_forward(policy, feats)
 
+        T_real = feats.shape[1]
+        log_probs = F.log_softmax(logits.float(), dim=-1)
+        log_probs_real = log_probs[:, :T_real, :]
+
+        dist_cat = Categorical(logits=log_probs_real)
+        actions = dist_cat.sample((G_SAMPLES,))                     # (G, B, T)
+        old_lp = log_probs_real.unsqueeze(0).expand(G_SAMPLES, -1, -1, -1) \
+                            .gather(3, actions.unsqueeze(3)).squeeze(3)
+        rw = compute_rewards(actions, rets, bh_sharpe, bh_return)
         adv = rw.detach()
 
         # ── 迭代深度奖励缩放 ──
-        # exit_iters: (B,), 值域 [min_iterations, max_iterations]
-        # 线性从 ITER_REWARD_START 到 ITER_REWARD_END
         iter_range = MAX_ITERATIONS - MIN_ITERATIONS
         if iter_range > 0:
             t_frac = ((exit_iters - MIN_ITERATIONS) / iter_range).clamp(0, 1)
         else:
             t_frac = torch.zeros_like(exit_iters)
         iter_scale = ITER_REWARD_START + (ITER_REWARD_END - ITER_REWARD_START) * t_frac
-        adv = adv * iter_scale.unsqueeze(0)                 # (G, B)
+        adv = adv * iter_scale.unsqueeze(0)                         # (G, B)
+
+        # ── 梯度更新 ──
+        logits, _ = sliding_forward(policy, feats)
+        log_probs = F.log_softmax(logits.float(), dim=-1)
+        log_probs_real = log_probs[:, :T_real, :]
 
         cur_lp = log_probs_real.unsqueeze(0).expand(G_SAMPLES, -1, -1, -1) \
                           .gather(3, actions.unsqueeze(3)).squeeze(3)
@@ -186,27 +179,27 @@ def train_grpo(policy, ref_policy, train_feats, train_rets,
         surr2 = ratio.clamp(1 - EPS_CLIP, 1 + EPS_CLIP) * adv_exp
         loss_clip = -torch.min(surr1, surr2).mean()
 
-        # KL(π_ref || π_θ) — includes EOS
+        # KL(π_ref || π_θ)
         with torch.no_grad():
-            ref_logits, _, _ = sliding_forward(ref_policy, pred_feats)
+            ref_logits, _ = sliding_forward(ref_policy, feats)
             ref_lp = F.log_softmax(ref_logits.float(), dim=-1)
             ref_p  = ref_lp.exp()
         kl = (ref_p * (ref_lp - log_probs)).sum(dim=-1).mean()
 
         entropy = -(log_probs.exp() * log_probs).sum(dim=-1).mean()
 
-        # 路由器行向量正交正则: mean(<w_i,w_j>^2) × (d/E)
+        # 路由器正交正则
         if ORTHO_COEFF > 0:
             ortho_loss = torch.tensor(0.0, device=feats.device)
             for router in [*raw_model.moa_kda.q_routers,
                            *raw_model.moa_kda.kv_routers,
                            raw_model.moe_swiglu.expert_router,
                            raw_model.router.proj]:
-                W = router.weight                                   # (E, d)
+                W = router.weight
                 E, d = W.shape
-                G = W @ W.T                                         # (E, E) 两两点乘
+                G = W @ W.T
                 idx = torch.triu_indices(E, E, offset=1, device=G.device)
-                pairs = G[idx[0], idx[1]]                           # (C,), C = E*(E-1)/2
+                pairs = G[idx[0], idx[1]]
                 ortho_loss = ortho_loss + pairs.pow(2).mean() * (d / E) / 2
             ortho_loss = ORTHO_COEFF * ortho_loss
         else:
@@ -221,6 +214,7 @@ def train_grpo(policy, ref_policy, train_feats, train_rets,
             opt.step()
         for sch in schedulers:
             sch.step()
+
         return loss.item(), rw.mean().item(), rw.std().item()
 
     # ── Training loop ──

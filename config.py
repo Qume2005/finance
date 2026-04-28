@@ -4,7 +4,7 @@ SEED = 16
 WINDOWS = [5, 10, 20, 30, 50, 100, 200]
 
 # ── 序列数量 ──
-N_TRAIN_SERIES = 100000      # 训练序列数
+N_TRAIN_SERIES = 200000      # 训练序列数
 N_TEST_SERIES  = 20        # 测试序列数
 N_SERIES = N_TRAIN_SERIES + N_TEST_SERIES
 
@@ -23,28 +23,33 @@ LAMBDA_REWARD = 0.5          # 0=纯夏普率差值, 1=纯期末收益差值
 REWARD_SCALE = 10
 ORTHO_COEFF  = 0.5         # 路由Query向量正交正则系数
 EPS_CLIP    = 0.2
-BETA_KL     = 0.0
-ENTROPY_COEFF = 0.0
-N_EPISODES  = 200000
+BETA_KL     = 0.00
+ENTROPY_COEFF = 0.00
+N_EPISODES  = 10000
+INNER_STEPS = 8             # 模型内循环固定步数（每个 halting 点内的 MoA+MoE 重复次数）
 SAVE_EVERY  = 500
 LR          = 1e-3
 WEIGHT_DECAY = 0
-BATCH_SIZE  = 32
+BATCH_SIZE  = 6
 # Output
 OUTPUT_DIR = "output"
 
 # Dynamic loop
-MAX_ITERATIONS = 24
+MAX_ITERATIONS = 4
 MIN_ITERATIONS = 1
 ITER_REWARD_START = 1.0     # min_iterations 时的奖励系数
 ITER_REWARD_END   = 0.5     # max_iterations 时的奖励系数
 
+# ── 探索噪声 ──
+ROUTE_TEMP    = 2.0         # Q/KV 专家路由温度（>1 更随机，<1 更贪心）
+FFN_GUMBEL_TAU = 1.0        # FFN Gumbel 噪声强度（0=确定性，越大越随机）
+HALT_TEMP     = 2.0         # 停机决策温度（>1 更随机，<1 更贪心）
+
 # MoA Attention
 N_ATTN_HEADS = 3               # 注意力 Head 数
-N_Q_EXPERTS_PER_HEAD = 4      # 每 Head Q 专家数（含零专家）
-N_KV_EXPERTS_PER_HEAD = 4     # 每 Head KV 专家数（含零专家）
+N_EXPERTS_PER_HEAD = 8        # 每 Head 统一专家数（含零专家，expert 0 对 Q 为零）
 
 # MoE FFN
 N_FFN_EXPERTS = 48            # MoE 前馈专家数
 FFN_TOP_PROB  = 0.8
-FFN_MAX_K     = 3
+FFN_MAX_K     = 6

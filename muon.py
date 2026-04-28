@@ -214,7 +214,7 @@ class NewtonMuon(Muon):
                 state = self.state[p]
 
                 # State initialization
-                if len(state) == 0:
+                if 'momentum_buffer' not in state:
                     state['step'] = 0
                     state['momentum_buffer'] = torch.zeros_like(G)
 

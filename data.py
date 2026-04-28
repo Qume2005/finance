@@ -5,9 +5,8 @@ import pandas as pd                              # only for bdate_range
 import torch
 
 from config import (SEED, WINDOWS,
-                    N_TRAIN_SERIES, N_TEST_SERIES, N_SERIES,
-                    N_TRAIN_DAYS, N_TEST_DAYS,
-                    TRAIN_IDS, TEST_IDS)
+                    N_TRAIN_SERIES, N_TEST_SERIES,
+                    N_TRAIN_DAYS, N_TEST_DAYS)
 
 
 # ── A-stock market parameter tables ──────────────────────────────
@@ -97,6 +96,7 @@ def compute_mmn_batch_gpu(prices):
         features.append(d_rmax[:, offset:])
 
     feats = torch.stack(features, dim=-1)              # (N, T-200, 14)
+    del features, log_c                                 # 释放中间张量
 
     # daily_return aligned to the same rows
     daily_ret = prices[:, 1:] / prices[:, :-1] - 1    # (N, T-1)
@@ -273,13 +273,20 @@ def _generate_block_gpu(n_series, n_days, param_rng, seed, device,
     if feat_mean is None:
         feat_mean = feats.mean(dim=(0, 1))                     # (14,)
         feat_std  = feats.std(dim=(0, 1))                      # (14,)
+    else:
+        feat_mean = feat_mean.to(device)
+        feat_std  = feat_std.to(device)
     feats_norm = (feats - feat_mean) / (feat_std + 1e-8)
 
-    # Split into per-series tensors (compatible with train.py indexing)
-    feats_list = [feats_norm[i] for i in range(n_series)]
-    rets_list  = [rets[i] for i in range(n_series)]
+    # Split into per-series CPU tensors — 随取随用，避免显存浪费
+    feats_list = [feats_norm[i].cpu() for i in range(n_series)]
+    rets_list  = [rets[i].cpu() for i in range(n_series)]
 
-    return feats_list, rets_list, feat_mean, feat_std, prices_list
+    # 立即释放 GPU 中间张量
+    del prices_gpu, feats, feats_norm, rets
+    torch.cuda.empty_cache()
+
+    return feats_list, rets_list, feat_mean.cpu(), feat_std.cpu(), prices_list
 
 
 def _df_to_tensors(df, feat_cols, scaler, series_ids, device):

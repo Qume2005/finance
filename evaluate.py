@@ -10,52 +10,41 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
-from config import TEST_IDS, OUTPUT_DIR, EPISODE_LEN
+from config import TEST_IDS, OUTPUT_DIR, EPISODE_LEN, MAX_ITERATIONS
 
 
 # ────────────────── Backtest ──────────────────
 
 def backtest_series(policy, feats, rets, label=""):
-    """Run backtest with sliding window, KDA warm-up, and parallelized batch reshape."""
+    """Run backtest with parallel sliding window (same as train)."""
+    device = next(policy.parameters()).device
+    feats = feats.to(device)
+    rets = rets.to(device)
     T = feats.shape[0] - 1                               # 可决策的时间步
     D = feats.shape[1]
-    n_w = (T + EPISODE_LEN - 1) // EPISODE_LEN
-    pad = n_w * EPISODE_LEN - T
     with torch.no_grad():
         f = feats[:T]                                    # (T, D)
+        n_w = (T + EPISODE_LEN - 1) // EPISODE_LEN
+        pad = n_w * EPISODE_LEN - T
         if pad:
             f = torch.cat([f, f.new_zeros(pad, D)], dim=0)
 
-        # KDA 预热：前 EPISODE_LEN 步只积累状态
-        warmup = f[:EPISODE_LEN].unsqueeze(0)
-        _, kda_states, _ = policy(warmup, kda_states=None)
+        # 所有窗口作为 batch 并行 forward
+        windows = f.reshape(n_w, EPISODE_LEN, D)         # (n_w, EPISODE_LEN, D)
+        logits, exit_iters_w = policy(windows)
+        # logits: (n_w, EPISODE_LEN+1, n_actions)
 
-        # 预测：剩余步
-        pred_f = f[EPISODE_LEN:]
-        pred_T = pred_f.shape[0]
-        pred_n_w = (pred_T + EPISODE_LEN - 1) // EPISODE_LEN
-        pred_pad = pred_n_w * EPISODE_LEN - pred_T
-        if pred_pad:
-            pred_f = torch.cat([pred_f, pred_f.new_zeros(pred_pad, D)], dim=0)
+        # 去掉每个窗口的 EOS，拼接；最后补上最后一个窗口的 EOS
+        logits_3d = logits.reshape(n_w, EPISODE_LEN + 1, -1)
+        non_eos = logits_3d[:, :-1, :].reshape(n_w * EPISODE_LEN, -1)
+        positions = non_eos[:T].argmax(dim=-1)
 
-        all_logits = []
-        all_exit_iters = []
-        for w in range(pred_n_w):
-            window = pred_f[w * EPISODE_LEN:(w + 1) * EPISODE_LEN].unsqueeze(0)
-            logits_w, kda_states, exit_iter_w = policy(window, kda_states=kda_states)
-            all_logits.append(logits_w.squeeze(0)[:-1, :])   # strip EOS
-            # exit_iter_w: (1,) → expand to window length
-            n_valid = min(EPISODE_LEN, T - EPISODE_LEN - w * EPISODE_LEN)
-            all_exit_iters.append(exit_iter_w.squeeze(0).item())
+        # per-window depth → per-token
+        exit_iters = exit_iters_w.cpu().numpy()
+        exit_iters = np.repeat(exit_iters, EPISODE_LEN)[:T]
 
-        logits = torch.cat(all_logits, dim=0)[:T - EPISODE_LEN]
-        positions = logits.argmax(dim=-1)
-
-        # Per-window exit iteration depth → broadcast to per-token
-        exit_iters = np.repeat(all_exit_iters, EPISODE_LEN)[:T - EPISODE_LEN]
-
-    rets_f = rets[1 + EPISODE_LEN:]                   # GPU — aligned with post-warmup predictions
-    pos_w = positions.float() / 10.0                  # GPU
+    rets_f = rets[1:T + 1]                              # aligned with positions[0:T]
+    pos_w = positions.float() / 10.0
 
     # strategy equity — all on GPU
     strat_daily = pos_w * rets_f
@@ -274,11 +263,13 @@ def plot_results(results, test_ids=None, output_dir=None):
         axes[1].set_ylabel("Drawdown")
         axes[1].legend()
 
-        # 3) Position heatmap
-        axes[2].imshow(r["positions"].reshape(1, -1), aspect="auto",
-                       cmap="RdYlGn", vmin=0, vmax=10, interpolation="nearest")
+        # 3) Position — fill_between like depth display
+        pos = r["positions"]
+        pos_days = np.arange(len(pos))
+        axes[2].fill_between(pos_days, pos, alpha=.7, color="tab:green")
         axes[2].set_ylabel("Position")
-        axes[2].set_yticks([])
+        axes[2].set_ylim(0, 10)
+        axes[2].set_yticks(range(0, 11, 2))
 
         # 4) Loop depth (exit iteration per token)
         if "exit_iters" in r:
@@ -286,7 +277,8 @@ def plot_results(results, test_ids=None, output_dir=None):
             axes[3].fill_between(exit_days, r["exit_iters"], alpha=.6, color="tab:orange")
             axes[3].set_ylabel("Loop Depth")
             axes[3].set_xlabel("Trading Day")
-            axes[3].set_ylim(bottom=0)
+            axes[3].set_ylim(0, MAX_ITERATIONS)
+            axes[3].set_yticks(range(0, MAX_ITERATIONS + 1, max(1, MAX_ITERATIONS // 4)))
 
         plt.tight_layout()
         _save_fig(fig, f"fig_03_test_series_{sid}.png", output_dir)
