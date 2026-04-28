@@ -37,7 +37,7 @@ OUTPUT_DIR = "output"
 MAX_ITERATIONS = 24
 MIN_ITERATIONS = 1
 ITER_REWARD_START = 1.0     # min_iterations 时的奖励系数
-ITER_REWARD_END   = 0.75     # max_iterations 时的奖励系数
+ITER_REWARD_END   = 0.5     # max_iterations 时的奖励系数
 
 # MoA Attention
 N_ATTN_HEADS = 3               # 注意力 Head 数

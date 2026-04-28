@@ -36,6 +36,8 @@ def profile_forward():
         record_shapes=True,
         with_stack=True,
         profile_memory=False,
+        with_modules=True,
+        acc_events=True,
     ) as prof:
         with torch.no_grad():
             model(x)

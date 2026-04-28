@@ -485,13 +485,10 @@ class HaltingRouter(nn.Module):
         self.norm = nn.RMSNorm(nd)
         self.mix = nn.Linear(nd, nd, bias=False)
         self.proj = nn.Linear(d_hidden, 2, bias=False)
-        # 可学习的退出线性偏置 α·T
-        self.iter_alpha = nn.Parameter(torch.tensor(0.0))
 
-    def forward(self, stream, iter_idx):
+    def forward(self, stream):
         """
         stream: (B, n, T, d)
-        iter_idx: (B,) long tensor — current iteration index
         """
         B, n, T, d = stream.shape
         last = stream[:, :, -1, :]
@@ -500,7 +497,6 @@ class HaltingRouter(nn.Module):
         x = x.reshape(B, n, d).sum(dim=1)               # (B, d)
 
         logits = self.proj(x)                             # (B, 2)
-        logits[:, 1] = logits[:, 1] + F.silu(self.iter_alpha) * iter_idx.float()
         return logits
 
 
@@ -604,11 +600,9 @@ class KDAPolicyNetwork(nn.Module):
         H = self.n_heads
         active = torch.ones(B, dtype=torch.bool, device=stream.device)
         exit_iter = torch.full((B,), float(self.max_iterations), device=stream.device)
-        sample_depth = torch.zeros(B, dtype=torch.long, device=stream.device)
 
         for i in range(self.max_iterations):
-            iter_t = sample_depth
-            logits = self.router(stream, iter_idx=iter_t)
+            logits = self.router(stream)
             ste, hard = _ste_route(logits)
 
             if i < self.min_iterations:
@@ -651,7 +645,6 @@ class KDAPolicyNetwork(nn.Module):
                                     torch.tensor(float(i + 1), device=stream.device),
                                     exit_iter)
             active = active & hard_cont
-            sample_depth = sample_depth + active.long()
             if not active.any():
                 break
 
