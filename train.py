@@ -13,7 +13,8 @@ from config import (SEED, EPISODE_LEN, G_SAMPLES, LAMBDA_REWARD, REWARD_SCALE,
                     EPS_CLIP, BETA_KL, N_EPISODES, LR, BATCH_SIZE,
                     WEIGHT_DECAY, SAVE_EVERY, OUTPUT_DIR, ENTROPY_COEFF,
                     MAX_ITERATIONS, MIN_ITERATIONS,
-                    ITER_REWARD_START, ITER_REWARD_END, ORTHO_COEFF)
+                    ITER_REWARD_START, ITER_REWARD_END, ORTHO_COEFF,
+                    DEPTH_PENALTY_COEFF)
 from muon import NewtonMuon
 
 
@@ -112,18 +113,15 @@ def train_grpo(policy, ref_policy, train_feats, train_rets,
         # (B, n_w*EPISODE_LEN, D) → (B*n_w, EPISODE_LEN, D)
         windows = feats.reshape(B * n_w, EPISODE_LEN, D)
 
-        logits, exit_iters = model(windows)
+        logits, exit_iters, route_lp, expected_depth = model(windows)
 
-        # logits: (B*n_w, EPISODE_LEN+1, n_actions)
-        logits_4d = logits.reshape(B, n_w, EPISODE_LEN + 1, -1)
-
-        # 所有窗口去掉 EOS，拼起来；最后补上最后一个窗口的 EOS
-        non_eos = logits_4d[:, :, :-1, :].reshape(B, n_w * EPISODE_LEN, -1)
-        last_eos = logits_4d[:, -1, -1:, :]
-        result = torch.cat([non_eos[:, :T, :], last_eos], dim=1)  # (B, T+1, n_actions)
+        # logits: (B*n_w, n_actions) — one action per window
+        result = logits.reshape(B, n_w, -1)                  # (B, n_w, n_actions)
 
         exit_avg = exit_iters.reshape(B, n_w).float().mean(dim=-1)
-        return result, exit_avg
+        route_lp_avg = route_lp.reshape(B, n_w).float().mean(dim=-1)  # (B,)
+        exp_depth_avg = expected_depth.reshape(B, n_w).float().mean(dim=-1)  # (B,)
+        return result, exit_avg, route_lp_avg, exp_depth_avg
 
     def grpo_step():
         feats, rets = sample_series_batch()
@@ -144,17 +142,20 @@ def train_grpo(policy, ref_policy, train_feats, train_rets,
 
         # parallel window forward — 采样阶段
         with torch.no_grad():
-            logits, exit_iters = sliding_forward(policy, feats)
+            sample_logits, exit_iters, sample_route_lp, sample_exp_depth = sliding_forward(policy, feats)
 
         T_real = feats.shape[1]
-        log_probs = F.log_softmax(logits.float(), dim=-1)
-        log_probs_real = log_probs[:, :T_real, :]
+        sample_log_probs = F.log_softmax(sample_logits.float(), dim=-1)  # (B, n_w, n_actions)
 
-        dist_cat = Categorical(logits=log_probs_real)
-        actions = dist_cat.sample((G_SAMPLES,))                     # (G, B, T)
-        old_lp = log_probs_real.unsqueeze(0).expand(G_SAMPLES, -1, -1, -1) \
-                            .gather(3, actions.unsqueeze(3)).squeeze(3)
-        rw = compute_rewards(actions, rets, bh_sharpe, bh_return)
+        dist_cat = Categorical(logits=sample_log_probs)
+        actions = dist_cat.sample((G_SAMPLES,))                         # (G, B, n_w)
+        old_action_lp = sample_log_probs.unsqueeze(0).expand(G_SAMPLES, -1, -1, -1) \
+                            .gather(3, actions.unsqueeze(3)).squeeze(3)  # (G, B, n_w)
+
+        # Tile per-window actions to per-timestep for reward computation
+        actions_tiled = actions.unsqueeze(-1).expand(-1, -1, -1, EPISODE_LEN) \
+                            .reshape(G_SAMPLES, feats.shape[0], -1)[:, :, :T_real]  # (G, B, T_real)
+        rw = compute_rewards(actions_tiled, rets, bh_sharpe, bh_return)
         adv = rw.detach()
 
         # ── 迭代深度奖励缩放 ──
@@ -167,21 +168,30 @@ def train_grpo(policy, ref_policy, train_feats, train_rets,
         adv = adv * iter_scale.unsqueeze(0)                         # (G, B)
 
         # ── 梯度更新 ──
-        logits, _ = sliding_forward(policy, feats)
-        log_probs = F.log_softmax(logits.float(), dim=-1)
-        log_probs_real = log_probs[:, :T_real, :]
+        logits, _, route_lp, exp_depth = sliding_forward(policy, feats)
+        log_probs = F.log_softmax(logits.float(), dim=-1)           # (B, n_w, n_actions)
 
-        cur_lp = log_probs_real.unsqueeze(0).expand(G_SAMPLES, -1, -1, -1) \
-                          .gather(3, actions.unsqueeze(3)).squeeze(3)
-        ratio = (cur_lp - old_lp).exp()
-        adv_exp = adv.unsqueeze(2)
-        surr1 = ratio * adv_exp
-        surr2 = ratio.clamp(1 - EPS_CLIP, 1 + EPS_CLIP) * adv_exp
+        # Action GRPO (standard, action log_probs only)
+        cur_action_lp = log_probs.unsqueeze(0).expand(G_SAMPLES, -1, -1, -1) \
+                          .gather(3, actions.unsqueeze(3)).squeeze(3)  # (G, B, n_w)
+        ratio = (cur_action_lp.sum(-1) - old_action_lp.sum(-1)).exp()  # (G, B)
+        surr1 = ratio * adv
+        surr2 = ratio.clamp(1 - EPS_CLIP, 1 + EPS_CLIP) * adv
         loss_clip = -torch.min(surr1, surr2).mean()
+
+        # Routing REINFORCE: route_lp * (reward - baseline)
+        # MoE/MoA routing gets reward signal; depth is handled by expected_depth penalty
+        route_reward = rw.mean(0)                                   # (B,) raw reward
+        route_baseline = route_reward.mean().detach()
+        route_advantage = (route_reward - route_baseline).detach()  # (B,)
+        loss_route_reinforce = -(route_lp * route_advantage).mean()
+
+        # Expected depth penalty: counterbalance backprop's "always continue" tendency
+        loss_depth = DEPTH_PENALTY_COEFF * exp_depth.mean()
 
         # KL(π_ref || π_θ)
         with torch.no_grad():
-            ref_logits, _ = sliding_forward(ref_policy, feats)
+            ref_logits, _, _, _ = sliding_forward(ref_policy, feats)
             ref_lp = F.log_softmax(ref_logits.float(), dim=-1)
             ref_p  = ref_lp.exp()
         kl = (ref_p * (ref_lp - log_probs)).sum(dim=-1).mean()
@@ -205,7 +215,7 @@ def train_grpo(policy, ref_policy, train_feats, train_rets,
         else:
             ortho_loss = torch.tensor(0.0, device=feats.device)
 
-        loss = loss_clip + BETA_KL * kl - ENTROPY_COEFF * entropy + ortho_loss
+        loss = loss_clip + loss_route_reinforce + BETA_KL * kl - ENTROPY_COEFF * entropy + ortho_loss + loss_depth
         for opt in optimizers:
             opt.zero_grad()
         loss.backward()

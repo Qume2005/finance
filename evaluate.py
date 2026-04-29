@@ -31,13 +31,11 @@ def backtest_series(policy, feats, rets, label=""):
 
         # 所有窗口作为 batch 并行 forward
         windows = f.reshape(n_w, EPISODE_LEN, D)         # (n_w, EPISODE_LEN, D)
-        logits, exit_iters_w = policy(windows)
-        # logits: (n_w, EPISODE_LEN+1, n_actions)
+        logits, exit_iters_w, _, _ = policy(windows)     # logits: (n_w, n_actions)
 
-        # 去掉每个窗口的 EOS，拼接；最后补上最后一个窗口的 EOS
-        logits_3d = logits.reshape(n_w, EPISODE_LEN + 1, -1)
-        non_eos = logits_3d[:, :-1, :].reshape(n_w * EPISODE_LEN, -1)
-        positions = non_eos[:T].argmax(dim=-1)
+        # 每窗口 1 个 action → tile 到 per-timestep
+        positions = logits.argmax(dim=-1)                 # (n_w,)
+        positions = positions.unsqueeze(-1).expand(-1, EPISODE_LEN).reshape(-1)[:T]
 
         # per-window depth → per-token
         exit_iters = exit_iters_w.cpu().numpy()

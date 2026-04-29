@@ -26,19 +26,20 @@ EPS_CLIP    = 0.2
 BETA_KL     = 0.00
 ENTROPY_COEFF = 0.00
 N_EPISODES  = 10000
-INNER_STEPS = 8             # 模型内循环固定步数（每个 halting 点内的 MoA+MoE 重复次数）
+INNER_STEPS = 12             # 模型内循环固定步数（每个 halting 点内的 MoA+MoE 重复次数）
 SAVE_EVERY  = 500
 LR          = 1e-3
 WEIGHT_DECAY = 0
-BATCH_SIZE  = 6
+BATCH_SIZE  = 1
 # Output
 OUTPUT_DIR = "output"
 
 # Dynamic loop
-MAX_ITERATIONS = 4
+MAX_ITERATIONS = 6
 MIN_ITERATIONS = 1
-ITER_REWARD_START = 1.0     # min_iterations 时的奖励系数
+ITER_REWARD_START = 2.0     # min_iterations 时的奖励系数
 ITER_REWARD_END   = 0.5     # max_iterations 时的奖励系数
+DEPTH_PENALTY_COEFF = 0.1   # expected_depth 惩罚系数（对抗 backprop "永远继续" 的偏向）
 
 # ── 探索噪声 ──
 ROUTE_TEMP    = 2.0         # Q/KV 专家路由温度（>1 更随机，<1 更贪心）
