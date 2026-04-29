@@ -115,7 +115,7 @@ def train_grpo(policy, ref_policy, train_feats, train_rets,
 
         logits, exit_iters, route_lp, expected_depth = model(windows)
 
-        # logits: (B*n_w, n_actions) — one action per window
+        # logits: (B*n_w, n_actions) — one action per window, predicts NEXT window
         result = logits.reshape(B, n_w, -1)                  # (B, n_w, n_actions)
 
         exit_avg = exit_iters.reshape(B, n_w).float().mean(dim=-1)
@@ -152,9 +152,13 @@ def train_grpo(policy, ref_policy, train_feats, train_rets,
         old_action_lp = sample_log_probs.unsqueeze(0).expand(G_SAMPLES, -1, -1, -1) \
                             .gather(3, actions.unsqueeze(3)).squeeze(3)  # (G, B, n_w)
 
-        # Tile per-window actions to per-timestep for reward computation
-        actions_tiled = actions.unsqueeze(-1).expand(-1, -1, -1, EPISODE_LEN) \
-                            .reshape(G_SAMPLES, feats.shape[0], -1)[:, :, :T_real]  # (G, B, T_real)
+        # Shift: window i's action → timesteps [(i+1)*EPISODE_LEN : (i+2)*EPISODE_LEN]
+        # First EPISODE_LEN timesteps: neutral position 5
+        default = torch.full((G_SAMPLES, feats.shape[0], EPISODE_LEN), 5,
+                             dtype=actions.dtype, device=actions.device)
+        shifted = actions[:, :, :-1].unsqueeze(-1).expand(-1, -1, -1, EPISODE_LEN) \
+                      .reshape(G_SAMPLES, feats.shape[0], -1)
+        actions_tiled = torch.cat([default, shifted], dim=-1)[:, :, :T_real]  # (G, B, T_real)
         rw = compute_rewards(actions_tiled, rets, bh_sharpe, bh_return)
         adv = rw.detach()
 

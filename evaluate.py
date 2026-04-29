@@ -33,9 +33,12 @@ def backtest_series(policy, feats, rets, label=""):
         windows = f.reshape(n_w, EPISODE_LEN, D)         # (n_w, EPISODE_LEN, D)
         logits, exit_iters_w, _, _ = policy(windows)     # logits: (n_w, n_actions)
 
-        # 每窗口 1 个 action → tile 到 per-timestep
-        positions = logits.argmax(dim=-1)                 # (n_w,)
-        positions = positions.unsqueeze(-1).expand(-1, EPISODE_LEN).reshape(-1)[:T]
+        # Shift: window i's action → timesteps [(i+1)*EPISODE_LEN : (i+2)*EPISODE_LEN]
+        # First EPISODE_LEN timesteps: neutral position 5
+        actions = logits.argmax(dim=-1)                    # (n_w,)
+        default = torch.full((EPISODE_LEN,), 5, dtype=actions.dtype, device=actions.device)
+        shifted = actions[:-1].unsqueeze(-1).expand(-1, EPISODE_LEN).reshape(-1)
+        positions = torch.cat([default, shifted])[:T]
 
         # per-window depth → per-token
         exit_iters = exit_iters_w.cpu().numpy()
