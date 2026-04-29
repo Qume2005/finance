@@ -271,6 +271,8 @@ class MoAKDALayer(nn.Module):
             kv_sel = kv_logits.argmax(dim=-1)
 
         q_zero = (q_sel == 0)                               # (H, B, T)
+        kv_zero = (kv_sel == 0)
+        zero_mask = q_zero | kv_zero                        # 任一选零专家 → 输出零
 
         # Routing log_probs for GRPO
         q_route_lp = q_probs.log().gather(-1, q_sel.unsqueeze(-1)).squeeze(-1)   # (H, B, T)
@@ -416,9 +418,9 @@ class MoAKDALayer(nn.Module):
             beta_buf.reshape(HB, T, 1), T)
         out_he = out_flat.reshape(H, B, T, self.dv)
 
-        # Zero out where expert 0 selected for Q
+        # Zero out where expert 0 selected
         for h in range(H):
-            out_he[h][q_zero[h]] = 0.0
+            out_he[h][zero_mask[h]] = 0.0
 
         all_outs = [out_he[h] for h in range(H)]
 
@@ -508,8 +510,9 @@ class MoESwiGLU(nn.Module):
         moe_mask = (gate_moe > 0)
         route_lp = (router_probs.log().clamp(min=-10) * moe_mask.float()).sum(-1)  # (B, T)
 
-        # ── Identify active experts ──
+        # ── Identify active experts (skip zero expert) ──
         active_idx = (gate_moe > 0).any(dim=(0, 1)).nonzero(as_tuple=True)[0]
+        active_idx = active_idx[active_idx > 0]                     # 零专家不参与计算
         K = active_idx.shape[0]
         if K == 0:
             return stream.new_zeros(B, n, T, d), gate_moe, route_lp
