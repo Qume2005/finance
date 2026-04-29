@@ -5,7 +5,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from config import (N_ATTN_HEADS, N_EXPERTS_PER_HEAD,
+from config import (D_HIDDEN, D_KEY, D_ATTN, N_ATTN_HEADS, N_EXPERTS_PER_HEAD,
                     N_FFN_EXPERTS, FFN_TOP_PROB, FFN_MAX_K,
                     MAX_ITERATIONS, MIN_ITERATIONS, INNER_STEPS,
                     ROUTE_TEMP, FFN_GUMBEL_TAU, HALT_TEMP)
@@ -100,23 +100,25 @@ class MoAKDALayer(nn.Module):
     Per-head top-1 routing for Q and KV independently.
     Per-head KDA, concat heads → preGate(KV) → W_o → postGate(Q).
     """
-    def __init__(self, d_input, d_key=16, d_value=16,
+    def __init__(self, d_input, d_key=16, d_attn=48,
                  n_heads=8, n_experts_per_head=6,
                  n_mhc=4):
         super().__init__()
-        self.dk, self.dv = d_key, d_value
+        self.dk = d_key
+        self.dv = d_attn // n_heads
+        assert d_attn % n_heads == 0, f"d_attn={d_attn} must be divisible by n_heads={n_heads}"
         self.dk_pope = d_key * 2
         self.H = n_heads
         self.E = n_experts_per_head
         self.n_mhc = n_mhc
         r = max(d_key // 4, 1)                          # LoRA rank
 
-        # ── Shared base projections ──
+        # ── Per-head base projections ──
         self.register_buffer(
             'freqs', 10000.0 ** (torch.arange(d_key).float() / d_key))
-        self.W_q = nn.Linear(d_input, d_key, bias=False)
-        self.W_k = nn.Linear(d_input, d_key, bias=False)
-        self.W_v = nn.Linear(d_input, d_value, bias=False)
+        self.W_q = nn.ModuleList([nn.Linear(d_input, d_key, bias=False) for _ in range(n_heads)])
+        self.W_k = nn.ModuleList([nn.Linear(d_input, d_key, bias=False) for _ in range(n_heads)])
+        self.W_v = nn.ModuleList([nn.Linear(d_input, self.dv, bias=False) for _ in range(n_heads)])
         self.pope_delta_raw = nn.Parameter(torch.zeros(d_key))
 
         # ── Per-head routers: Q + KV, both route into same expert pool ──
@@ -134,7 +136,7 @@ class MoAKDALayer(nn.Module):
         self.lora_A_k = nn.Parameter(torch.randn(HE, d_input, r) * 0.01)
         self.lora_B_k = nn.Parameter(torch.zeros(HE, r, d_key))
         self.lora_A_v = nn.Parameter(torch.randn(HE, d_input, r) * 0.01)
-        self.lora_B_v = nn.Parameter(torch.zeros(HE, r, d_value))
+        self.lora_B_v = nn.Parameter(torch.zeros(HE, r, self.dv))
 
         d_alpha = int(d_key * 1.618)
         self.alpha_up_w   = nn.Parameter(torch.randn(HE, d_input, d_alpha) * 0.01)
@@ -146,7 +148,7 @@ class MoAKDALayer(nn.Module):
         self.norm = nn.ModuleList([nn.RMSNorm(d_input) for _ in range(HE)])
 
         # ── Output path: preGate(KV) → W_o → postGate(Q) ──
-        concat_dim = n_heads * d_value                    # H * dv
+        concat_dim = d_attn                                # H * dv
         self.W_pre_w = nn.Parameter(torch.randn(HE, d_input, concat_dim) * 0.01)
         self.W_o   = nn.Linear(concat_dim, d_input, bias=False)
         d_pg = max(int(concat_dim * 0.618), 1)
@@ -246,7 +248,7 @@ class MoAKDALayer(nn.Module):
                     eff_q = q_prob_e + (mask_f - q_prob_e).detach()
                     delta_q = F.silu(h_e @ self.lora_A_q[idx]) @ self.lora_B_q[idx]
                     q_e = self._apply_pope(
-                        F.normalize(self.W_q(h_e) + delta_q, dim=-1), positions, True)
+                        F.normalize(self.W_q[h](h_e) + delta_q, dim=-1), positions, True)
                     q_h += eff_q * q_e
 
                     # Per-expert postGate
@@ -262,11 +264,11 @@ class MoAKDALayer(nn.Module):
 
                     delta_k = F.silu(h_e @ self.lora_A_k[idx]) @ self.lora_B_k[idx]
                     k_e = self._apply_pope(
-                        F.normalize(self.W_k(h_e) + delta_k, dim=-1), positions, False)
+                        F.normalize(self.W_k[h](h_e) + delta_k, dim=-1), positions, False)
                     k_h += eff_kv * k_e
 
                     delta_v = F.silu(h_e @ self.lora_A_v[idx]) @ self.lora_B_v[idx]
-                    v_e = F.silu(self.W_v(h_e) + delta_v)
+                    v_e = F.silu(self.W_v[h](h_e) + delta_v)
                     v_h += eff_kv * v_e
 
                     alpha_e = torch.sigmoid(
@@ -289,8 +291,8 @@ class MoAKDALayer(nn.Module):
             out_h[q_zero] = 0.0
             all_outs.append(out_h)
 
-        # ── Concatenate all heads ──
-        concat = torch.cat(all_outs, dim=-1)               # (B, T, H*dv)
+        # ── Concatenate all heads + scale ──
+        concat = torch.cat(all_outs, dim=-1) / math.sqrt(self.H * self.dv)
 
         # ── preGate(激活专家平均) → W_o → postGate(激活专家平均) ──
         gated = concat * acc_pre_gate
@@ -415,7 +417,8 @@ class KDAPolicyNetwork(nn.Module):
     Shared single MoA+MoE block looped dynamically.  Per-layer router
     decides continue/exit.  Training explores via pre-determined target depths.
     """
-    def __init__(self, d_input=14, d_hidden=48, n_actions=11,
+    def __init__(self, d_input=14, d_hidden=D_HIDDEN, d_key=D_KEY, d_attn=D_ATTN,
+                 n_actions=11,
                  max_iterations=MAX_ITERATIONS, inner_steps=INNER_STEPS,
                  n_mhc=4, min_iterations=MIN_ITERATIONS,
                  n_heads=N_ATTN_HEADS,
@@ -437,7 +440,8 @@ class KDAPolicyNetwork(nn.Module):
         self.eos = nn.Parameter(torch.randn(d_hidden) * 0.02)
 
         # MoA-KDA + MoE-SwiGLU
-        self.moa_kda = MoAKDALayer(d_hidden, n_heads=n_heads,
+        self.moa_kda = MoAKDALayer(d_hidden, d_key=d_key, d_attn=d_attn,
+                                    n_heads=n_heads,
                                     n_experts_per_head=n_experts_per_head,
                                     n_mhc=n_mhc)
         self.moe_swiglu = MoESwiGLU(d_hidden, n_experts=n_ffn_experts, n_mhc=n_mhc,
