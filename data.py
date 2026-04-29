@@ -341,15 +341,16 @@ def prepare_test_data(device, feat_mean, feat_std):
     Generate test data using GPU-native pipeline with pre-computed normalization.
     Returns dict with prices_list (for plotting) and per-series GPU tensors.
     """
-    np.random.seed(SEED)
-    torch.manual_seed(SEED)
-    param_rng = np.random.RandomState(SEED)
+    test_seed = SEED + 7919                               # 不同 seed，避免与训练集重复
+    np.random.seed(test_seed)
+    torch.manual_seed(test_seed)
+    param_rng = np.random.RandomState(test_seed)
     mt_choices = ["main", "chinext", "star"]
     mt_weights = [0.60, 0.25, 0.15]
 
     print(f"  Generating {N_TEST_SERIES} test series (GPU)...")
     test_feats, test_rets, _, _, prices_list = _generate_block_gpu(
-        N_TEST_SERIES, N_TEST_DAYS, param_rng, SEED, device,
+        N_TEST_SERIES, N_TEST_DAYS, param_rng, test_seed, device,
         mt_choices, mt_weights, need_prices_list=True,
         feat_mean=feat_mean, feat_std=feat_std)
     print(f"  Done. {len(test_feats)} series.")
