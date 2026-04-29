@@ -99,7 +99,7 @@ def train_grpo(policy, ref_policy, train_feats, train_rets,
         n_series = len(train_feats)
         indices = torch.randint(n_series, (BATCH_SIZE,))
         f_batch = torch.stack([train_feats[idx.item()][:seq_len] for idx in indices]).to(rank, non_blocking=True)
-        r_batch = torch.stack([train_rets[idx.item()][1:T] for idx in indices]).to(rank, non_blocking=True)
+        r_batch = torch.stack([train_rets[idx.item()][:seq_len] for idx in indices]).to(rank, non_blocking=True)
         return f_batch, r_batch
 
     def sliding_forward(model, feats):

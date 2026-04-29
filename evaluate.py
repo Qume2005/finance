@@ -44,7 +44,7 @@ def backtest_series(policy, feats, rets, label=""):
         exit_iters = exit_iters_w.cpu().numpy()
         exit_iters = np.repeat(exit_iters, EPISODE_LEN)[:T]
 
-    rets_f = rets[1:T + 1]                              # aligned with positions[0:T]
+    rets_f = rets[:T]                                     # action shift 已保证无 look-ahead
     pos_w = positions.float() / 10.0
 
     # strategy equity — all on GPU
