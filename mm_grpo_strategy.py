@@ -53,7 +53,8 @@ def cleanup_distributed():
 
 
 def create_models(device, is_main, world_size, local_rank):
-    """Create policy + ref model, compile, wrap with DDP if multi-GPU."""
+    """Create policy + ref model (uncompiled), wrap with DDP if multi-GPU.
+    Compilation is deferred to train_grpo() after checkpoint loading."""
     torch.manual_seed(SEED)
     raw_policy = KDAPolicyNetwork().to(device)
     torch.manual_seed(SEED)
@@ -63,25 +64,13 @@ def create_models(device, is_main, world_size, local_rank):
     for p in ref_policy.parameters():
         p.requires_grad = False
 
-    # torch.compile: only compile modules without Python loops
-    # _kda_step: module-level @torch.compile
-    # MoAKDALayer.forward, MoESwiGLU.forward, _loop, _attn_res: @torch.compiler.disable
-    # MoAKDALayer internal Linears: NOT compiled (different shapes cause recompile,
-    #   and they run inside disabled forward anyway)
-    raw_policy.router = torch.compile(raw_policy.router)
-    raw_policy._head = torch.compile(raw_policy._head)
-    raw_policy.inp_proj = torch.compile(raw_policy.inp_proj)
-    ref_policy.router = torch.compile(ref_policy.router)
-    ref_policy._head = torch.compile(ref_policy._head)
-    ref_policy.inp_proj = torch.compile(ref_policy.inp_proj)
-
     policy = raw_policy
 
     if is_main:
         n_params = sum(p.numel() for p in raw_policy.parameters())
         print(f"Parameters: {n_params:,}")
 
-    # DDP: gradient all-reduce across GPUs (compile first, then wrap)
+    # DDP: wrap before compile
     if world_size > 1:
         policy = DDP(policy, device_ids=[local_rank])
 

@@ -79,9 +79,8 @@ def train_grpo(policy, ref_policy, train_feats, train_rets,
     if ckpt_files:
         ckpt_path = ckpt_files[-1]
         ckpt = torch.load(ckpt_path, map_location="cpu", weights_only=False)
-        # 兼容单卡 torch.compile 保存的 checkpoint（key 带 _orig_mod. 前缀）
-        state = {k.replace("_orig_mod.", ""): v for k, v in ckpt["model"].items()}
-        raw_model.load_state_dict(state)
+        # checkpoint 保存时已去掉 _orig_mod. 前缀，直接加载
+        raw_model.load_state_dict(ckpt["model"])
         muon_opt.load_state_dict(ckpt["muon_opt"])
         sgd_opt.load_state_dict(ckpt["sgd_opt"])
         start_ep = ckpt["step"] + 1
@@ -93,6 +92,14 @@ def train_grpo(policy, ref_policy, train_feats, train_rets,
         for _ in range(ckpt["step"]):
             for sch in schedulers:
                 sch.step()
+
+    # ── 加载完 checkpoint 后再编译（避免 _orig_mod. key 不匹配）──
+    raw_model.router = torch.compile(raw_model.router)
+    raw_model._head = torch.compile(raw_model._head)
+    raw_model.inp_proj = torch.compile(raw_model.inp_proj)
+    ref_policy.router = torch.compile(ref_policy.router)
+    ref_policy._head = torch.compile(ref_policy._head)
+    ref_policy.inp_proj = torch.compile(ref_policy.inp_proj)
 
     def sample_series_batch():
         """Sample full training series from CPU, transfer to GPU."""
@@ -261,7 +268,7 @@ def train_grpo(policy, ref_policy, train_feats, train_rets,
                     ckpt_path = os.path.join(OUTPUT_DIR, f"ckpt_{ep}.pt")
                     torch.save({
                         "step": ep,
-                        "model": raw_model.state_dict(),
+                        "model": {k.replace("_orig_mod.", ""): v for k, v in raw_model.state_dict().items()},
                         "muon_opt": muon_opt.state_dict(),
                         "sgd_opt": sgd_opt.state_dict(),
                         "history": history,
@@ -275,7 +282,7 @@ def train_grpo(policy, ref_policy, train_feats, train_rets,
             ckpt_path = os.path.join(OUTPUT_DIR, f"ckpt_{last_ep}.pt")
             torch.save({
                 "step": last_ep,
-                "model": raw_model.state_dict(),
+                "model": {k.replace("_orig_mod.", ""): v for k, v in raw_model.state_dict().items()},
                 "muon_opt": muon_opt.state_dict(),
                 "sgd_opt": sgd_opt.state_dict(),
                 "history": history,

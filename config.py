@@ -4,7 +4,7 @@ SEED = 16
 WINDOWS = [5, 10, 20, 30, 50, 100, 200]
 
 # ── 序列数量 ──
-N_TRAIN_SERIES = 200000      # 训练序列数
+N_TRAIN_SERIES = 400000      # 训练序列数
 N_TEST_SERIES  = 20        # 测试序列数
 N_SERIES = N_TRAIN_SERIES + N_TEST_SERIES
 
