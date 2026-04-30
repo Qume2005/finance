@@ -271,31 +271,37 @@ def train_grpo(policy, ref_policy, train_feats, train_rets,
                           f"reward={rm:+.4f}±{rs:.4f}  lr={schedulers[0].get_last_lr()[0]:.2e}  "
                           f"[{elapsed:.0f}s]")
                 if SAVE_EVERY and ep % SAVE_EVERY == 0:
-                    # 删旧留新，只保留一个 checkpoint
-                    for old in glob.glob(os.path.join(OUTPUT_DIR, "ckpt_*.pt")):
-                        os.remove(old)
                     ckpt_path = os.path.join(OUTPUT_DIR, f"ckpt_{ep}.pt")
+                    tmp_path = ckpt_path + ".tmp"
                     torch.save({
                         "step": ep,
                         "model": {k.replace("_orig_mod.", ""): v for k, v in raw_model.state_dict().items()},
                         "muon_opt": muon_opt.state_dict(),
                         "sgd_opt": sgd_opt.state_dict(),
                         "history": history,
-                    }, ckpt_path)
+                    }, tmp_path)
+                    os.replace(tmp_path, ckpt_path)
+                    # 删旧 checkpoint（新 checkpoint 已安全写入）
+                    for old in glob.glob(os.path.join(OUTPUT_DIR, "ckpt_*.pt")):
+                        if old != ckpt_path:
+                            os.remove(old)
                     print(f"  Checkpoint saved → {ckpt_path}")
     except KeyboardInterrupt:
         if is_main:
             last_ep = ep if 'ep' in dir() else start_ep
-            for old in glob.glob(os.path.join(OUTPUT_DIR, "ckpt_*.pt")):
-                os.remove(old)
             ckpt_path = os.path.join(OUTPUT_DIR, f"ckpt_{last_ep}.pt")
+            tmp_path = ckpt_path + ".tmp"
             torch.save({
                 "step": last_ep,
                 "model": {k.replace("_orig_mod.", ""): v for k, v in raw_model.state_dict().items()},
                 "muon_opt": muon_opt.state_dict(),
                 "sgd_opt": sgd_opt.state_dict(),
                 "history": history,
-            }, ckpt_path)
+            }, tmp_path)
+            os.replace(tmp_path, ckpt_path)
+            for old in glob.glob(os.path.join(OUTPUT_DIR, "ckpt_*.pt")):
+                if old != ckpt_path:
+                    os.remove(old)
             print(f"\n  Interrupted at step {last_ep}. Checkpoint saved → {ckpt_path}")
 
     if is_main:

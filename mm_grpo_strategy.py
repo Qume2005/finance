@@ -114,30 +114,31 @@ def main():
     if is_main:
         plot_training_curves(history, output_dir=OUTPUT_DIR)
 
-    # Barrier: ensure all ranks finish training before rank 0 evaluates
+    # Barrier: ensure all ranks finish training
     if world_size > 1:
         dist.barrier()
+
+    # 非 rank-0：训练结束，直接退出
+    if not is_main:
+        if world_size > 1:
+            dist.destroy_process_group()
+        return
 
     # ──── Step 4: Test data + Evaluate (rank 0 only) ────
-    if is_main:
-        raw_policy.eval()
-        save_model(raw_policy, os.path.join(OUTPUT_DIR, "policy.pt"))
+    raw_policy.eval()
+    save_model(raw_policy, os.path.join(OUTPUT_DIR, "policy.pt"))
 
-        # generate test data now — only rank 0
-        test_data = prepare_test_data(device, data["feat_mean"], data["feat_std"])
-        plot_prices(test_data["prices_list"], output_dir=OUTPUT_DIR)
+    # generate test data now — only rank 0
+    test_data = prepare_test_data(device, data["feat_mean"], data["feat_std"])
+    plot_prices(test_data["prices_list"], output_dir=OUTPUT_DIR)
 
-        results = run_backtest(raw_policy, test_data["test_feats"], test_data["test_rets"])
-        plot_results(results, output_dir=OUTPUT_DIR)
+    results = run_backtest(raw_policy, test_data["test_feats"], test_data["test_rets"])
+    plot_results(results, output_dir=OUTPUT_DIR)
 
-        # Export CSV + JSON
-        export_results(results, history)
+    # Export CSV + JSON
+    export_results(results, history)
 
-        print_conclusions()
-
-    # 所有 rank 等 rank 0 完成 evaluate 再一起销毁 process group
-    if world_size > 1:
-        dist.barrier()
+    print_conclusions()
 
     cleanup_distributed()
 
