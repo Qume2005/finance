@@ -166,63 +166,48 @@ def train_grpo(policy, ref_policy, train_feats, train_rets,
             muon_opt._hooks = []
             muon_opt.update_preconditioner()
 
-        # 全序列并行 forward（无 KDA 状态传递）
-        bh_sharpe, bh_return = compute_bh_metrics(rets)            # (B,)
+        bh_sharpe, bh_return = compute_bh_metrics(rets)
 
-        # parallel window forward — 采样阶段
-        with torch.no_grad():
-            sample_logits, exit_iters, sample_route_lp, sample_exp_depth = sliding_forward(policy, feats)
+        # ── 单次 forward：同时用于采样和梯度 ──
+        logits, exit_iters, route_lp, exp_depth = sliding_forward(policy, feats)
+        log_probs = F.log_softmax(logits.float(), dim=-1)
 
+        # 采样 actions（detached，不影响梯度）
         T_real = feats.shape[1]
-        sample_log_probs = F.log_softmax(sample_logits.float(), dim=-1)  # (B, n_w, n_actions)
+        with torch.no_grad():
+            actions = Categorical(logits=log_probs).sample((G_SAMPLES,))
+            old_action_lp = log_probs.unsqueeze(0).expand(G_SAMPLES, -1, -1, -1) \
+                                .gather(3, actions.unsqueeze(3)).squeeze(3).detach()
 
-        dist_cat = Categorical(logits=sample_log_probs)
-        actions = dist_cat.sample((G_SAMPLES,))                         # (G, B, n_w)
-        old_action_lp = sample_log_probs.unsqueeze(0).expand(G_SAMPLES, -1, -1, -1) \
-                            .gather(3, actions.unsqueeze(3)).squeeze(3)  # (G, B, n_w)
-
-        # Shift: window i's action → timesteps [(i+1)*EPISODE_LEN : (i+2)*EPISODE_LEN]
-        # First EPISODE_LEN timesteps: neutral position 5
+        # Shift + reward
         default = torch.full((G_SAMPLES, feats.shape[0], EPISODE_LEN), 5,
                              dtype=actions.dtype, device=actions.device)
         shifted = actions[:, :, :-1].unsqueeze(-1).expand(-1, -1, -1, EPISODE_LEN) \
                       .reshape(G_SAMPLES, feats.shape[0], -1)
-        actions_tiled = torch.cat([default, shifted], dim=-1)[:, :, :T_real]  # (G, B, T_real)
+        actions_tiled = torch.cat([default, shifted], dim=-1)[:, :, :T_real]
         rw = compute_rewards(actions_tiled, rets, bh_sharpe, bh_return)
         adv = rw.detach()
 
-        # ── 迭代深度奖励缩放 ──
+        # 迭代深度奖励缩放
         iter_range = MAX_ITERATIONS - MIN_ITERATIONS
         if iter_range > 0:
             t_frac = ((exit_iters - MIN_ITERATIONS) / iter_range).clamp(0, 1)
         else:
             t_frac = torch.zeros_like(exit_iters)
         iter_scale = ITER_REWARD_START + (ITER_REWARD_END - ITER_REWARD_START) * t_frac
-        adv = adv * iter_scale.unsqueeze(0)                         # (G, B)
+        adv = adv * iter_scale.unsqueeze(0)
 
-        # ── 梯度更新 ──
-        logits, _, route_lp, exp_depth = sliding_forward(policy, feats)
-        log_probs = F.log_softmax(logits.float(), dim=-1)           # (B, n_w, n_actions)
-
-        # ── ref forward 与 loss 计算并行 ──
-        ref_stream = torch.cuda.Stream(device=rank)
-        with torch.cuda.stream(ref_stream):
-            with torch.no_grad():
-                ref_logits, _, _, _ = sliding_forward(ref_policy, feats)
-                ref_lp = F.log_softmax(ref_logits.float(), dim=-1)
-                ref_p  = ref_lp.exp()
-
-        # 不依赖 ref 的 loss 项（与 ref forward 并行执行）
+        # ── Loss 计算 ──
         cur_action_lp = log_probs.unsqueeze(0).expand(G_SAMPLES, -1, -1, -1) \
-                          .gather(3, actions.unsqueeze(3)).squeeze(3)  # (G, B, n_w)
-        ratio = (cur_action_lp.sum(-1) - old_action_lp.sum(-1)).exp()  # (G, B)
+                          .gather(3, actions.unsqueeze(3)).squeeze(3)
+        ratio = (cur_action_lp.sum(-1) - old_action_lp.sum(-1)).exp()
         surr1 = ratio * adv
         surr2 = ratio.clamp(1 - EPS_CLIP, 1 + EPS_CLIP) * adv
         loss_clip = -torch.min(surr1, surr2).mean()
 
-        route_reward = rw.mean(0)                                   # (B,) raw reward
+        route_reward = rw.mean(0)
         route_baseline = route_reward.mean().detach()
-        route_advantage = (route_reward - route_baseline).detach()  # (B,)
+        route_advantage = (route_reward - route_baseline).detach()
         loss_route_reinforce = -(route_lp * route_advantage).mean()
 
         loss_depth = DEPTH_PENALTY_COEFF * exp_depth.mean()
@@ -244,9 +229,13 @@ def train_grpo(policy, ref_policy, train_feats, train_rets,
         else:
             ortho_loss = torch.tensor(0.0, device=feats.device)
 
-        # 等 ref forward 完成
-        torch.cuda.current_stream(rank).wait_stream(ref_stream)
-        kl = (ref_p * (ref_lp - log_probs)).sum(dim=-1).mean()
+        kl = torch.tensor(0.0, device=feats.device)
+        if BETA_KL > 0:
+            with torch.no_grad():
+                ref_logits, _, _, _ = sliding_forward(ref_policy, feats)
+                ref_lp = F.log_softmax(ref_logits.float(), dim=-1)
+                ref_p  = ref_lp.exp()
+            kl = (ref_p * (ref_lp - log_probs)).sum(dim=-1).mean()
 
         loss = loss_clip + loss_route_reinforce + BETA_KL * kl - ENTROPY_COEFF * entropy + ortho_loss + loss_depth
         for opt in optimizers:
