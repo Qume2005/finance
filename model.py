@@ -187,13 +187,9 @@ class MoAKDALayer(nn.Module):
         self.W_k_w = nn.Parameter(torch.randn(n_heads, d_key, d_input) * 0.01)
         self.W_v_w = nn.Parameter(torch.randn(n_heads, self.dv, d_input) * 0.01)
 
-        # ── Per-head routers: Q + KV ──
-        self.q_routers = nn.ModuleList([
-            nn.Linear(d_input, n_experts_per_head, bias=False)
-            for _ in range(n_heads)])
-        self.kv_routers = nn.ModuleList([
-            nn.Linear(d_input, n_experts_per_head, bias=False)
-            for _ in range(n_heads)])
+        # ── Per-head routers: Q + KV (stacked for batched matmul) ──
+        self.q_router_w = nn.Parameter(torch.randn(n_heads, n_experts_per_head, d_input) * 0.01)
+        self.kv_router_w = nn.Parameter(torch.randn(n_heads, n_experts_per_head, d_input) * 0.01)
 
         # ── Unified expert params (flat: idx = h*E + e) ──
         HE = n_heads * n_experts_per_head
@@ -242,7 +238,6 @@ class MoAKDALayer(nn.Module):
             out[:, t] = attn_out
         return out
 
-    @torch.compiler.disable
     def forward(self, stream):
         """
         stream: (B, n_mhc, T, d)
@@ -255,8 +250,8 @@ class MoAKDALayer(nn.Module):
         route_input = stream.mean(dim=1)                   # (B, T, d)
 
         # ════════════════ 1. Batched routing ════════════════
-        q_logits = torch.stack([self.q_routers[h](route_input) for h in range(H)])
-        kv_logits = torch.stack([self.kv_routers[h](route_input) for h in range(H)])
+        q_logits = torch.einsum('btd,hed->hbte', route_input, self.q_router_w)
+        kv_logits = torch.einsum('btd,hed->hbte', route_input, self.kv_router_w)
         q_logits = q_logits.clamp(-10, 10)                 # (H, B, T, E)
         kv_logits = kv_logits.clamp(-10, 10)
 
@@ -340,11 +335,11 @@ class MoAKDALayer(nn.Module):
                 pg_out = torch.sigmoid(torch.einsum(
                     'kbte,ked->kbtd', F.silu(pg_mid), self.W_pg2_w[q_fi]))
                 eff_q_pg = eff_q * pg_out
-                for h in range(H):
-                    hm = (q_hi == h)
-                    if hm.any():
-                        q_h_buf[h] += eff_q_out[hm].sum(0)
-                        acc_post_gate += eff_q_pg[hm].sum(0) / H
+                idx_q = q_hi.view(-1, 1, 1, 1).expand_as(eff_q_out)
+                q_h_buf.scatter_add_(0, idx_q, eff_q_out)
+                acc_post_gate = acc_post_gate + torch.zeros(
+                    H, B, T, d, device=stream.device, dtype=eff_q_pg.dtype
+                ).scatter_add_(0, idx_q, eff_q_pg).sum(0) / H
 
             # ════════════════ 5. Batched KV path ════════════════
             kv_path = kv_active[active_h, active_e]
@@ -396,17 +391,15 @@ class MoAKDALayer(nn.Module):
                 eff_kv_a = eff_kv * alpha_out
                 eff_kv_b = eff_kv * beta_out
                 eff_kv_pg = eff_kv * pre_gate_out
-                for h in range(H):
-                    hm = (kv_hi == h)
-                    if hm.any():
-                        k_h_buf[h] += eff_kv_k[hm].sum(0)
-                        v_h_buf[h] += eff_kv_v[hm].sum(0)
-                        alpha_buf[h] += eff_kv_a[hm].sum(0)
-                        beta_buf[h] += eff_kv_b[hm].sum(0)
-                        acc_pre_gate += eff_kv_pg[hm].sum(0) / H
-                        # mHC outputs
-                        acc_H_res += (H_res_k[ki[hm]] * eff_kv[hm].unsqueeze(-1)).sum(0)
-                        acc_H_post += (H_post_k[ki[hm]] * eff_kv[hm]).sum(0)
+                idx_kv = kv_hi.view(-1, 1, 1, 1)
+                k_h_buf.scatter_add_(0, idx_kv.expand_as(eff_kv_k), eff_kv_k)
+                v_h_buf.scatter_add_(0, idx_kv.expand_as(eff_kv_v), eff_kv_v)
+                alpha_buf.scatter_add_(0, idx_kv.expand_as(eff_kv_a), eff_kv_a)
+                beta_buf.scatter_add_(0, idx_kv.expand_as(eff_kv_b), eff_kv_b)
+                # pre_gate / mHC: sum over all kv experts (no per-head separation needed)
+                acc_pre_gate = acc_pre_gate + eff_kv_pg.sum(0) / H
+                acc_H_res = acc_H_res + (H_res_k[ki] * eff_kv.unsqueeze(-1)).sum(0)
+                acc_H_post = acc_H_post + (H_post_k[ki] * eff_kv).sum(0)
 
         # ════════════════ 6. Batched KDA (all heads at once) ════════════════
         HB = H * B
@@ -419,13 +412,10 @@ class MoAKDALayer(nn.Module):
         out_he = out_flat.reshape(H, B, T, self.dv)
 
         # Zero out where expert 0 selected
-        for h in range(H):
-            out_he[h][zero_mask[h]] = 0.0
-
-        all_outs = [out_he[h] for h in range(H)]
+        out_he[zero_mask] = 0.0
 
         # ════════════════ 7. Output assembly ════════════════
-        concat = torch.cat(all_outs, dim=-1) / math.sqrt(self.H * self.dv)
+        concat = out_he.permute(1, 2, 0, 3).reshape(B, T, H * self.dv) / math.sqrt(self.H * self.dv)
 
         gated = concat * acc_pre_gate
         proj = self.W_o(gated)                              # (B, T, d)

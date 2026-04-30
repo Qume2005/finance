@@ -214,13 +214,14 @@ def train_grpo(policy, ref_policy, train_feats, train_rets,
         # 路由器正交正则
         if ORTHO_COEFF > 0:
             ortho_loss = torch.tensor(0.0, device=feats.device)
-            for router in [*raw_model.moa_kda.q_routers,
-                           *raw_model.moa_kda.kv_routers,
-                           raw_model.moe_swiglu.expert_router,
-                           raw_model.router.proj]:
-                W = router.weight
-                E, d = W.shape
-                G = W @ W.T
+            for W in [raw_model.moa_kda.q_router_w,
+                      raw_model.moa_kda.kv_router_w,
+                      raw_model.moe_swiglu.expert_router.weight,
+                      raw_model.router.proj.weight]:
+                # W: (n, d) or (n_heads, E, d) → flatten first dim
+                W_flat = W.reshape(-1, W.shape[-1])
+                E, d = W_flat.shape
+                G = W_flat @ W_flat.T
                 idx = torch.triu_indices(E, E, offset=1, device=G.device)
                 pairs = G[idx[0], idx[1]]
                 ortho_loss = ortho_loss + pairs.pow(2).mean() * (d / E) / 2
