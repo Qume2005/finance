@@ -145,6 +145,10 @@ def main():
 
         print_conclusions()
 
+    # 所有 rank 等 rank 0 完成 evaluate 再一起销毁 process group
+    if world_size > 1:
+        dist.barrier()
+
     cleanup_distributed()
 
 
