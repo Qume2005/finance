@@ -8,6 +8,7 @@ Usage:
 """
 
 import os
+import datetime
 import warnings
 
 os.environ.setdefault("TORCH_NCCL_ASYNC_ERROR_HANDLING", "1")
@@ -38,7 +39,8 @@ def setup_distributed():
         local_rank = int(os.environ["LOCAL_RANK"])
         torch.cuda.set_device(local_rank)
         device = torch.device(f"cuda:{local_rank}")
-        dist.init_process_group("nccl", device_id=device)
+        dist.init_process_group("nccl", device_id=device,
+                                timeout=datetime.timedelta(hours=1))
         rank       = dist.get_rank()
         world_size = dist.get_world_size()
     else:
