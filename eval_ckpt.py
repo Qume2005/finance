@@ -27,7 +27,8 @@ def main():
     # 加载模型
     model = KDAPolicyNetwork().to(device)
     ckpt = torch.load(ckpt_path, map_location=device, weights_only=False)
-    model.load_state_dict(ckpt["model"])
+    state = {k.replace("_orig_mod.", ""): v for k, v in ckpt["model"].items()}
+    model.load_state_dict(state)
     model.eval()
     print(f"Restored step {ckpt['step']}")
 

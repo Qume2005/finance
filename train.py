@@ -79,7 +79,9 @@ def train_grpo(policy, ref_policy, train_feats, train_rets,
     if ckpt_files:
         ckpt_path = ckpt_files[-1]
         ckpt = torch.load(ckpt_path, map_location="cpu", weights_only=False)
-        raw_model.load_state_dict(ckpt["model"])
+        # 兼容单卡 torch.compile 保存的 checkpoint（key 带 _orig_mod. 前缀）
+        state = {k.replace("_orig_mod.", ""): v for k, v in ckpt["model"].items()}
+        raw_model.load_state_dict(state)
         muon_opt.load_state_dict(ckpt["muon_opt"])
         sgd_opt.load_state_dict(ckpt["sgd_opt"])
         start_ep = ckpt["step"] + 1

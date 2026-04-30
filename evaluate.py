@@ -111,43 +111,12 @@ def run_backtest(policy, test_feats, test_rets, test_ids=None):
     return results
 
 
-# ────────────────── Model Checkpoint ──────────────────
-
-def save_checkpoint(model, optimizer, scheduler, history, epoch, path):
-    """Save full training state for resume."""
-    torch.save({
-        "epoch": epoch,
-        "model_state_dict": model.state_dict(),
-        "optimizer_state_dict": optimizer.state_dict(),
-        "scheduler_state_dict": scheduler.state_dict(),
-        "history": history,
-    }, path)
-    print(f"Checkpoint saved → {path}")
-
-
-def load_checkpoint(path, model, optimizer=None, scheduler=None):
-    """Load training state. Returns (epoch, history)."""
-    ckpt = torch.load(path, map_location="cpu", weights_only=False)
-    model.load_state_dict(ckpt["model_state_dict"])
-    if optimizer and "optimizer_state_dict" in ckpt:
-        optimizer.load_state_dict(ckpt["optimizer_state_dict"])
-    if scheduler and "scheduler_state_dict" in ckpt:
-        scheduler.load_state_dict(ckpt["scheduler_state_dict"])
-    print(f"Checkpoint loaded ← {path}  (epoch {ckpt.get('epoch', '?')})")
-    return ckpt.get("epoch", 0), ckpt.get("history", {})
-
+# ────────────────── Model Save/Load ──────────────────
 
 def save_model(model, path):
     """Save model weights only (for inference)."""
     torch.save(model.state_dict(), path)
     print(f"Model saved → {path}")
-
-
-def load_model(model, path):
-    """Load model weights for inference."""
-    model.load_state_dict(torch.load(path, map_location="cpu", weights_only=False))
-    print(f"Model loaded ← {path}")
-    return model
 
 
 # ────────────────── Result Export ──────────────────
