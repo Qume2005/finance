@@ -231,7 +231,7 @@ class MoAKDALayer(nn.Module):
         imag = mu * torch.sin(phi)
         return torch.cat([real, imag], dim=-1)
 
-    @torch.compile
+    @torch.compiler.disable
     def _kda_recursion(self, q, k, v, alpha, beta, T):
         B = q.shape[0]
         S = q.new_zeros(B, self.dk_pope, self.dv)
