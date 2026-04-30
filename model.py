@@ -335,11 +335,11 @@ class MoAKDALayer(nn.Module):
                 pg_out = torch.sigmoid(torch.einsum(
                     'kbte,ked->kbtd', F.silu(pg_mid), self.W_pg2_w[q_fi]))
                 eff_q_pg = eff_q * pg_out
-                idx_q = q_hi.view(-1, 1, 1, 1).expand_as(eff_q_out)
-                q_h_buf.scatter_add_(0, idx_q, eff_q_out)
+                idx_q = q_hi.view(-1, 1, 1, 1)
+                q_h_buf.scatter_add_(0, idx_q.expand_as(eff_q_out), eff_q_out)
                 acc_post_gate = acc_post_gate + torch.zeros(
                     H, B, T, d, device=stream.device, dtype=eff_q_pg.dtype
-                ).scatter_add_(0, idx_q, eff_q_pg).sum(0) / H
+                ).scatter_add_(0, idx_q.expand_as(eff_q_pg), eff_q_pg).sum(0) / H
 
             # ════════════════ 5. Batched KV path ════════════════
             kv_path = kv_active[active_h, active_e]

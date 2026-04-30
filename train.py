@@ -3,6 +3,7 @@
 import os
 import glob
 import time
+import threading
 import numpy as np
 import torch
 import torch.nn as nn
@@ -132,12 +133,31 @@ def train_grpo(policy, ref_policy, train_feats, train_rets,
         exp_depth_avg = expected_depth.reshape(B, n_w).float().mean(dim=-1)  # (B,)
         return result, exit_avg, route_lp_avg, exp_depth_avg
 
+    # ── Data prefetcher: overlap CPU sampling with GPU compute ──
+    class _Prefetcher:
+        def __init__(self, sample_fn):
+            self.sample_fn = sample_fn
+            self._next = sample_fn()
+            self._thread = None
+
+        def _prefetch(self):
+            self._next = self.sample_fn()
+
+        def get(self):
+            if self._thread is not None:
+                self._thread.join()
+            batch = self._next
+            self._thread = threading.Thread(target=self._prefetch, daemon=True)
+            self._thread.start()
+            return batch
+
+    prefetcher = _Prefetcher(sample_series_batch)
+
     def grpo_step():
-        feats, rets = sample_series_batch()
-        torch.cuda.current_stream(rank).synchronize()
+        feats, rets = prefetcher.get()
         _global_step[0] += 1
         if _global_step[0] % muon_opt.refresh_interval == 0:
-            # Temporarily register hooks → eager forward → collect ZZ^T → remove hooks
+            torch.cuda.current_stream(rank).synchronize()
             muon_opt.register_hooks(raw_model)
             with torch.no_grad():
                 raw_model(feats[:, :EPISODE_LEN, :])
@@ -184,7 +204,15 @@ def train_grpo(policy, ref_policy, train_feats, train_rets,
         logits, _, route_lp, exp_depth = sliding_forward(policy, feats)
         log_probs = F.log_softmax(logits.float(), dim=-1)           # (B, n_w, n_actions)
 
-        # Action GRPO (standard, action log_probs only)
+        # ── ref forward 与 loss 计算并行 ──
+        ref_stream = torch.cuda.Stream(device=rank)
+        with torch.cuda.stream(ref_stream):
+            with torch.no_grad():
+                ref_logits, _, _, _ = sliding_forward(ref_policy, feats)
+                ref_lp = F.log_softmax(ref_logits.float(), dim=-1)
+                ref_p  = ref_lp.exp()
+
+        # 不依赖 ref 的 loss 项（与 ref forward 并行执行）
         cur_action_lp = log_probs.unsqueeze(0).expand(G_SAMPLES, -1, -1, -1) \
                           .gather(3, actions.unsqueeze(3)).squeeze(3)  # (G, B, n_w)
         ratio = (cur_action_lp.sum(-1) - old_action_lp.sum(-1)).exp()  # (G, B)
@@ -192,33 +220,20 @@ def train_grpo(policy, ref_policy, train_feats, train_rets,
         surr2 = ratio.clamp(1 - EPS_CLIP, 1 + EPS_CLIP) * adv
         loss_clip = -torch.min(surr1, surr2).mean()
 
-        # Routing REINFORCE: route_lp * (reward - baseline)
-        # MoE/MoA routing gets reward signal; depth is handled by expected_depth penalty
         route_reward = rw.mean(0)                                   # (B,) raw reward
         route_baseline = route_reward.mean().detach()
         route_advantage = (route_reward - route_baseline).detach()  # (B,)
         loss_route_reinforce = -(route_lp * route_advantage).mean()
 
-        # Expected depth penalty: counterbalance backprop's "always continue" tendency
         loss_depth = DEPTH_PENALTY_COEFF * exp_depth.mean()
-
-        # KL(π_ref || π_θ)
-        with torch.no_grad():
-            ref_logits, _, _, _ = sliding_forward(ref_policy, feats)
-            ref_lp = F.log_softmax(ref_logits.float(), dim=-1)
-            ref_p  = ref_lp.exp()
-        kl = (ref_p * (ref_lp - log_probs)).sum(dim=-1).mean()
-
         entropy = -(log_probs.exp() * log_probs).sum(dim=-1).mean()
 
-        # 路由器正交正则
         if ORTHO_COEFF > 0:
             ortho_loss = torch.tensor(0.0, device=feats.device)
             for W in [raw_model.moa_kda.q_router_w,
                       raw_model.moa_kda.kv_router_w,
                       raw_model.moe_swiglu.expert_router.weight,
                       raw_model.router.proj.weight]:
-                # W: (n, d) or (n_heads, E, d) → flatten first dim
                 W_flat = W.reshape(-1, W.shape[-1])
                 E, d = W_flat.shape
                 G = W_flat @ W_flat.T
@@ -228,6 +243,10 @@ def train_grpo(policy, ref_policy, train_feats, train_rets,
             ortho_loss = ORTHO_COEFF * ortho_loss
         else:
             ortho_loss = torch.tensor(0.0, device=feats.device)
+
+        # 等 ref forward 完成
+        torch.cuda.current_stream(rank).wait_stream(ref_stream)
+        kl = (ref_p * (ref_lp - log_probs)).sum(dim=-1).mean()
 
         loss = loss_clip + loss_route_reinforce + BETA_KL * kl - ENTROPY_COEFF * entropy + ortho_loss + loss_depth
         for opt in optimizers:
