@@ -217,7 +217,7 @@ def train_grpo(policy, ref_policy, train_feats, train_rets,
             ortho_loss = torch.tensor(0.0, device=feats.device)
             for W in [raw_model.moa_kda.q_router_w,
                       raw_model.moa_kda.kv_router_w,
-                      raw_model.moe_swiglu.expert_router.weight,
+                      raw_model.moe_swiglu.router_w,
                       raw_model.router.proj.weight]:
                 W_flat = W.reshape(-1, W.shape[-1])
                 E, d = W_flat.shape

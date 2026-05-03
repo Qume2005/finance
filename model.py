@@ -6,9 +6,9 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from config import (D_HIDDEN, D_KEY, D_ATTN, N_ATTN_HEADS, N_EXPERTS_PER_HEAD,
-                    N_FFN_EXPERTS, FFN_TOP_PROB, FFN_MAX_K,
+                    N_FFN_HEADS, N_EXPERTS_PER_FFN_HEAD,
                     MAX_ITERATIONS, MIN_ITERATIONS, INNER_STEPS,
-                    ROUTE_TEMP, FFN_GUMBEL_TAU, HALT_TEMP)
+                    ROUTE_TEMP, HALT_TEMP)
 
 
 # ────────────────── Utilities ──────────────────
@@ -210,11 +210,10 @@ class MoAKDALayer(nn.Module):
         self.batched_mhc = BatchedMHC(HE, d_input, n_mhc)
         self.batched_norm_w = nn.Parameter(torch.ones(HE, d_input))
 
-        # ── Output path: preGate(KV) → W_o → postGate(Q) ──
-        concat_dim = d_attn                                # H * dv
-        self.W_pre_w = nn.Parameter(torch.randn(HE, d_input, concat_dim) * 0.01)
-        self.W_o   = nn.Linear(concat_dim, d_input, bias=False)
-        d_pg = max(int(concat_dim * 0.618), 1)
+        # ── Output path: per-head preGate(KV) → per-expert W_o → per-head postGate(Q) ──
+        self.W_pre_w = nn.Parameter(torch.randn(HE, d_input, self.dv) * 0.01)
+        self.W_o_w   = nn.Parameter(torch.randn(HE, d_input, self.dv) * 0.01)
+        d_pg = max(int(d_input * 0.618), 1)
         self.W_pg1_w = nn.Parameter(torch.randn(HE, d_input, d_pg) * 0.01)
         self.W_pg2_w = nn.Parameter(torch.randn(HE, d_pg, d_input) * 0.01)
 
@@ -291,8 +290,8 @@ class MoAKDALayer(nn.Module):
         v_h_buf = stream.new_zeros(H, B, T, self.dv)
         alpha_buf = stream.new_zeros(H, B, T, self.dk_pope)
         beta_buf  = stream.new_zeros(H, B, T, 1)
-        acc_pre_gate  = stream.new_zeros(B, T, H * self.dv)
-        acc_post_gate = stream.new_zeros(B, T, d)
+        acc_pre_gate  = stream.new_zeros(H, B, T, self.dv)
+        acc_post_gate = stream.new_zeros(H, B, T, d)
         acc_H_res  = stream.new_zeros(B, T, n, n)
         acc_H_post = stream.new_zeros(B, T, n)
 
@@ -337,9 +336,7 @@ class MoAKDALayer(nn.Module):
                 eff_q_pg = eff_q * pg_out
                 idx_q = q_hi.view(-1, 1, 1, 1)
                 q_h_buf.scatter_add_(0, idx_q.expand_as(eff_q_out), eff_q_out)
-                acc_post_gate = acc_post_gate + torch.zeros(
-                    H, B, T, d, device=stream.device, dtype=eff_q_pg.dtype
-                ).scatter_add_(0, idx_q.expand_as(eff_q_pg), eff_q_pg).sum(0) / H
+                acc_post_gate.scatter_add_(0, idx_q.expand_as(eff_q_pg), eff_q_pg)
 
             # ════════════════ 5. Batched KV path ════════════════
             kv_path = kv_active[active_h, active_e]
@@ -381,7 +378,7 @@ class MoAKDALayer(nn.Module):
                 beta_out = torch.sigmoid(torch.einsum(
                     'kbte,ked->kbtd', F.silu(b_mid), self.beta_down_w[kv_fi]))
 
-                # PreGate
+                # PreGate (per-head dv dim)
                 pre_gate_out = F.silu(torch.einsum(
                     'kbtd,kde->kbte', h_kv, self.W_pre_w[kv_fi]))
 
@@ -396,8 +393,7 @@ class MoAKDALayer(nn.Module):
                 v_h_buf.scatter_add_(0, idx_kv.expand_as(eff_kv_v), eff_kv_v)
                 alpha_buf.scatter_add_(0, idx_kv.expand_as(eff_kv_a), eff_kv_a)
                 beta_buf.scatter_add_(0, idx_kv.expand_as(eff_kv_b), eff_kv_b)
-                # pre_gate / mHC: sum over all kv experts (no per-head separation needed)
-                acc_pre_gate = acc_pre_gate + eff_kv_pg.sum(0) / H
+                acc_pre_gate.scatter_add_(0, idx_kv.expand_as(eff_kv_pg), eff_kv_pg)
                 acc_H_res = acc_H_res + (H_res_k[ki] * eff_kv.unsqueeze(-1)).sum(0)
                 acc_H_post = acc_H_post + (H_post_k[ki] * eff_kv).sum(0)
 
@@ -415,11 +411,17 @@ class MoAKDALayer(nn.Module):
         out_he[zero_mask] = 0.0
 
         # ════════════════ 7. Output assembly ════════════════
-        concat = out_he.permute(1, 2, 0, 3).reshape(B, T, H * self.dv) / math.sqrt(self.H * self.dv)
-
-        gated = concat * acc_pre_gate
-        proj = self.W_o(gated)                              # (B, T, d)
-        result = proj * acc_post_gate                       # (B, T, d)
+        # Per-head preGate → × prob → per-expert W_o → per-head postGate
+        out_he_scaled = out_he / math.sqrt(H * self.dv)
+        gated_he = out_he_scaled * acc_pre_gate            # (H, B, T, dv)
+        kv_prob_h = kv_probs.gather(-1, kv_sel.unsqueeze(-1)).squeeze(-1)
+        gated_he = gated_he * kv_prob_h.unsqueeze(-1)      # × routing prob
+        h_idx = torch.arange(H, device=stream.device).view(H, 1, 1)
+        flat_idx = h_idx * E + kv_sel                      # (H, B, T)
+        W_o_token = self.W_o_w[flat_idx]                   # (H, B, T, d, dv)
+        proj_he = torch.einsum('hbtv,hbtdv->hbtd', gated_he, W_o_token)
+        result_he = proj_he * acc_post_gate                # (H, B, T, d)
+        result = result_he.sum(0)                          # (B, T, d)
 
         H_res_avg  = acc_H_res / H
         H_post_avg = acc_H_post / H
@@ -454,97 +456,163 @@ class SwiGLU(nn.Module):
 
 class MoESwiGLU(nn.Module):
     """
-    MoE-SwiGLU with batched expert computation.
-    Only active experts (gate_moe > 0) participate in computation.
-    Returns stream update and gate_moe for external AttnRes query combination.
+    MoE-SwiGLU with per-head routing, mirroring MoA-KDA structure.
+    F heads, each with Ef experts (including zero expert 0).
+    Per-head top-1 routing. Output: per-head preGate → per-expert W_o → per-head postGate.
     """
-    def __init__(self, d_hidden, n_experts=16, n_mhc=4,
-                 top_prob=0.8, max_k=4):
+    def __init__(self, d_hidden, n_heads=6, n_experts_per_head=8, n_mhc=4):
         super().__init__()
-        self.n_experts = n_experts
-        self.top_prob = top_prob
-        self.max_k = max_k
-        self.batched_mhc = BatchedMHC(n_experts, d_hidden, n_mhc)
+        self.nf = n_heads
+        self.ne = n_experts_per_head
+        FE = n_heads * n_experts_per_head
+        self.FE = FE
+        self.d = d_hidden
+        self.n_mhc = n_mhc
 
+        # Routing: per-head stacked router
+        self.router_w = nn.Parameter(torch.randn(n_heads, n_experts_per_head, d_hidden) * 0.01)
+
+        # MHC + norm
+        self.batched_mhc = BatchedMHC(FE, d_hidden, n_mhc)
+        self.batched_norm_w = nn.Parameter(torch.ones(FE, d_hidden))
+
+        # SwiGLU
         d_ffn = int(d_hidden * 1.618)
-        self.swiglu_norm_w = nn.Parameter(torch.ones(n_experts, d_hidden))
-        self.swiglu_wd_w   = nn.Parameter(torch.randn(n_experts, d_hidden, d_hidden) * 0.01)
-        self.swiglu_wu_w   = nn.Parameter(torch.randn(n_experts, d_hidden, d_hidden) * 0.01)
-        self.swiglu_gate_w = nn.Parameter(torch.randn(n_experts, d_ffn, d_hidden) * 0.01)
-        self.swiglu_up_w   = nn.Parameter(torch.randn(n_experts, d_ffn, d_hidden) * 0.01)
-        self.swiglu_down_w = nn.Parameter(torch.randn(n_experts, d_hidden, d_ffn) * 0.01)
+        self.swiglu_wd_w   = nn.Parameter(torch.randn(FE, d_hidden, d_hidden) * 0.01)
+        self.swiglu_wu_w   = nn.Parameter(torch.randn(FE, d_hidden, d_hidden) * 0.01)
+        self.swiglu_gate_w = nn.Parameter(torch.randn(FE, d_ffn, d_hidden) * 0.01)
+        self.swiglu_up_w   = nn.Parameter(torch.randn(FE, d_ffn, d_hidden) * 0.01)
+        self.swiglu_down_w = nn.Parameter(torch.randn(FE, d_hidden, d_ffn) * 0.01)
 
-        self.expert_router = nn.Linear(d_hidden, n_experts, bias=False)
-        self.w_experts = nn.Parameter(torch.randn(n_experts, d_hidden) * 0.01)
+        # Output: per-head preGate → per-expert W_o → per-head postGate
+        self.W_pre_w = nn.Parameter(torch.randn(FE, d_hidden, d_hidden) * 0.01)
+        self.W_o_w   = nn.Parameter(torch.randn(FE, d_hidden, d_hidden) * 0.01)
+        d_pg = max(int(d_hidden * 0.618), 1)
+        self.W_pg1_w = nn.Parameter(torch.randn(FE, d_hidden, d_pg) * 0.01)
+        self.W_pg2_w = nn.Parameter(torch.randn(FE, d_pg, d_hidden) * 0.01)
+
+        # Expert embeddings for AttnRes query
+        self.w_experts = nn.Parameter(torch.randn(FE, d_hidden) * 0.01)
 
     @torch.compiler.disable
     def forward(self, stream):
         """
         stream: (B, n_mhc, T, d)
-        Returns: stream_update (B, n_mhc, T, d), gate_moe (B, T, E), route_lp (B, T)
+        Returns: stream_update (B, n_mhc, T, d), gate_moe (B, T, FE), route_lp (B, T)
         """
         B, n, T, d = stream.shape
-        E = self.n_experts
+        nf, ne, FE = self.nf, self.ne, self.FE
+        route_input = stream.mean(dim=1)                   # (B, T, d)
 
-        # ── Routing ──
-        route_input = stream.mean(dim=1)                    # (B, T, d)
-        router_logits = self.expert_router(route_input)
+        # ════════════════ 1. Routing ════════════════
+        logits = torch.einsum('btd,fed->fbte', route_input, self.router_w).clamp(-10, 10)
+        probs = F.softmax(logits / ROUTE_TEMP, dim=-1)     # (nf, B, T, ne)
+
         if self.training:
-            gumbel = -torch.log(-torch.log(torch.rand_like(router_logits) + 1e-8) + 1e-8)
-            router_logits = (router_logits + gumbel * FFN_GUMBEL_TAU).clamp(-10, 10)
-        gate_moe = top_prob_max_k(router_logits,
-                                   self.top_prob, self.max_k)  # (B, T, E)
+            sel = torch.multinomial(probs.reshape(-1, ne), 1).reshape(nf, B, T)
+        else:
+            sel = logits.argmax(dim=-1)                     # (nf, B, T)
 
-        # Routing log_probs for GRPO
-        router_probs = F.softmax(router_logits, dim=-1)     # (B, T, E)
-        moe_mask = (gate_moe > 0)
-        route_lp = (router_probs.log().clamp(min=-10) * moe_mask.float()).sum(-1)  # (B, T)
+        zero_mask = (sel == 0)                              # (nf, B, T)
 
-        # ── Identify active experts (skip zero expert) ──
-        active_idx = (gate_moe > 0).any(dim=(0, 1)).nonzero(as_tuple=True)[0]
-        active_idx = active_idx[active_idx > 0]                     # 零专家不参与计算
+        # Routing log probs for GRPO
+        route_lp = probs.log().gather(-1, sel.unsqueeze(-1)).squeeze(-1).sum(0)  # (B, T)
+
+        # gate_moe for AttnRes: (B, T, FE)
+        f_arange = torch.arange(nf, device=stream.device).view(nf, 1, 1)
+        flat_sel = f_arange * ne + sel                     # (nf, B, T)
+        sel_probs = probs.gather(-1, sel.unsqueeze(-1)).squeeze(-1)  # (nf, B, T)
+        gate_moe = stream.new_zeros(B * T, FE)
+        gate_moe.scatter_(-1,
+                          flat_sel.permute(1, 2, 0).reshape(B * T, nf),
+                          sel_probs.permute(1, 2, 0).reshape(B * T, nf))
+        gate_moe = gate_moe.reshape(B, T, FE)
+
+        # ════════════════ 2. Active pairs ════════════════
+        e_range = torch.arange(ne, device=stream.device)
+        active = (sel.unsqueeze(-1) == e_range).any(dim=(1, 2))  # (nf, ne)
+        active_flat = active.reshape(-1)
+        active_idx = active_flat.nonzero(as_tuple=True)[0]
         K = active_idx.shape[0]
-        if K == 0:
-            return stream.new_zeros(B, n, T, d), gate_moe, route_lp
+        active_f = active_idx // ne
+        active_ef = active_idx % ne
 
-        # ── Batched MHC for active experts ──
-        stream_exp = stream.unsqueeze(0).expand(K, -1, -1, -1, -1)  # (K, B, n, T, d)
-        H_res, H_pre, H_post = self.batched_mhc(stream, active_idx)
-        # H_res: (K, B, T, n, n), H_pre: (K, B, T, n), H_post: (K, B, T, n)
+        # ════════════════ 3. Accumulators ════════════════
+        out_buf = stream.new_zeros(nf, B, T, d)
+        acc_pre_gate = stream.new_zeros(nf, B, T, d)
+        acc_post_gate = stream.new_zeros(nf, B, T, d)
+        acc_H_res = stream.new_zeros(B, T, n, n)
+        acc_H_post = stream.new_zeros(B, T, n)
 
-        # h_e = H_pre weighted mix of streams
-        h_e = torch.einsum('kbtn,kbntd->kbtd', H_pre, stream_exp)   # (K, B, T, d)
+        if K > 0:
+            # Only non-zero experts compute
+            nonzero = (active_ef > 0)
+            if nonzero.any():
+                ki = nonzero.nonzero(as_tuple=True)[0]
+                f_hi = active_f[ki]
+                ef_ei = active_ef[ki]
+                fi = active_idx[ki]
 
-        # ── Batched SwiGLU for active experts ──
-        # Gather params
-        nw   = self.swiglu_norm_w[active_idx]   # (K, d)
-        wd_w = self.swiglu_wd_w[active_idx]     # (K, d, d)
-        wu_w = self.swiglu_wu_w[active_idx]     # (K, d, d)
-        gw   = self.swiglu_gate_w[active_idx]   # (K, d_ffn, d)
-        uw   = self.swiglu_up_w[active_idx]     # (K, d_ffn, d)
-        dw   = self.swiglu_down_w[active_idx]   # (K, d, d_ffn)
+                # ════════════════ 4. Batched MHC + norm ════════════════
+                H_res_k, H_pre_k, H_post_k = self.batched_mhc(stream, fi)
+                stream_exp = stream.unsqueeze(0).expand(ki.shape[0], -1, -1, -1, -1)
+                h_e = torch.einsum('kbtn,kbntd->kbtd', H_pre_k, stream_exp)
 
-        # Batched RMSNorm
-        rms = h_e.float().pow(2).mean(-1, keepdim=True).add(1e-8).rsqrt().to(h_e.dtype)
-        h = h_e * rms * nw.unsqueeze(1).unsqueeze(1)                   # (K, B, T, d)
+                nw = self.batched_norm_w[fi]
+                rms = h_e.float().pow(2).mean(-1, keepdim=True).add(1e-8).rsqrt().to(h_e.dtype)
+                h_e = h_e * rms * nw.unsqueeze(1).unsqueeze(1)
 
-        # Bottleneck gate: silu(x @ wd) @ wu → sigmoid
-        wd_out = torch.einsum('kbtd,kod->kbto', h, wd_w)               # (K, B, T, d)
-        g = torch.sigmoid(torch.einsum('kbtd,kod->kbto', F.silu(wd_out), wu_w))
+                # STE mask
+                mask_k = (sel[f_hi] == ef_ei.unsqueeze(1).unsqueeze(2))
+                prob_k = probs[f_hi, :, :, ef_ei]
+                eff = (prob_k + (mask_k.float() - prob_k).detach()).unsqueeze(-1)  # (K, B, T, 1)
 
-        # SwiGLU core: silu(x @ gate) * (x @ up) → down
-        gate_out = torch.einsum('kbtd,kod->kbto', h, gw)               # (K, B, T, d_ffn)
-        up_out   = torch.einsum('kbtd,kod->kbto', h, uw)               # (K, B, T, d_ffn)
-        out_e = g * torch.einsum('kbtf,kof->kbto', F.silu(gate_out) * up_out, dw)
+                # ════════════════ 5. Batched SwiGLU ════════════════
+                wd_out = torch.einsum('kbtd,kod->kbto', h_e, self.swiglu_wd_w[fi])
+                g = torch.sigmoid(torch.einsum('kbtd,kod->kbto', F.silu(wd_out), self.swiglu_wu_w[fi]))
+                gate_out = torch.einsum('kbtd,kod->kbto', h_e, self.swiglu_gate_w[fi])
+                up_out = torch.einsum('kbtd,kod->kbto', h_e, self.swiglu_up_w[fi])
+                swiglu_out = g * torch.einsum('kbtf,kof->kbto', F.silu(gate_out) * up_out, self.swiglu_down_w[fi])
 
-        # ── Gate and accumulate ──
-        gate_e = gate_moe[:, :, active_idx]                             # (B, T, K)
-        gate_4d = gate_e.permute(2, 0, 1).unsqueeze(2).unsqueeze(-1)   # (K, B, 1, T, 1)
+                eff_out = eff * swiglu_out                   # (K, B, T, d)
 
-        res  = torch.einsum('kbtij,kbjtd->kbitd', H_res, stream_exp)   # (K, B, n, T, d)
-        post = torch.einsum('kbtn,kbtd->kbntd', H_post, out_e)         # (K, B, n, T, d)
+                # PreGate
+                pre_gate_out = F.silu(torch.einsum('kbtd,kde->kbte', h_e, self.W_pre_w[fi]))
+                eff_pg = eff * pre_gate_out
 
-        stream_update = (gate_4d * (res + post)).sum(dim=0)             # (B, n, T, d)
+                # PostGate
+                pg_mid = torch.einsum('kbtd,kde->kbte', h_e, self.W_pg1_w[fi])
+                pg_out = torch.sigmoid(torch.einsum('kbte,ked->kbtd', F.silu(pg_mid), self.W_pg2_w[fi]))
+                eff_post = eff * pg_out
+
+                # Scatter-accumulate to per-head buffers
+                idx_f = f_hi.view(-1, 1, 1, 1)
+                out_buf.scatter_add_(0, idx_f.expand_as(eff_out), eff_out)
+                acc_pre_gate.scatter_add_(0, idx_f.expand_as(eff_pg), eff_pg)
+                acc_post_gate.scatter_add_(0, idx_f.expand_as(eff_post), eff_post)
+
+                # mHC accumulation
+                acc_H_res = acc_H_res + (H_res_k * eff.unsqueeze(-1)).sum(0)
+                acc_H_post = acc_H_post + (H_post_k * eff).sum(0)
+
+        # ════════════════ 6. Output assembly ════════════════
+        out_buf[zero_mask] = 0.0
+
+        # Per-head preGate → × prob → per-expert W_o → per-head postGate
+        gated = out_buf * acc_pre_gate                     # (nf, B, T, d)
+        gated = gated * sel_probs.unsqueeze(-1)            # × routing prob
+        flat_idx = f_arange * ne + sel                     # (nf, B, T)
+        W_o_token = self.W_o_w[flat_idx]                   # (nf, B, T, d, d)
+        proj = torch.einsum('hbtd,hbted->hbte', gated, W_o_token)  # (nf, B, T, d)
+        result_he = proj * acc_post_gate                   # (nf, B, T, d)
+        result = result_he.sum(0)                          # (B, T, d)
+
+        # mHC
+        H_res_avg = acc_H_res / nf
+        H_post_avg = acc_H_post / nf
+        res = torch.einsum('btij,bjtd->bitd', H_res_avg, stream)
+        post = torch.einsum('btn,btd->bntd', H_post_avg, result)
+        stream_update = res + post
 
         return stream_update, gate_moe, route_lp
 
@@ -593,8 +661,8 @@ class KDAPolicyNetwork(nn.Module):
                  n_mhc=4, min_iterations=MIN_ITERATIONS,
                  n_heads=N_ATTN_HEADS,
                  n_experts_per_head=N_EXPERTS_PER_HEAD,
-                 n_ffn_experts=N_FFN_EXPERTS,
-                 ffn_top_prob=FFN_TOP_PROB, ffn_max_k=FFN_MAX_K):
+                 n_ffn_heads=N_FFN_HEADS,
+                 n_experts_per_ffn_head=N_EXPERTS_PER_FFN_HEAD):
         super().__init__()
         self.max_iterations = max_iterations
         self.inner_steps = inner_steps
@@ -611,14 +679,14 @@ class KDAPolicyNetwork(nn.Module):
                                     n_heads=n_heads,
                                     n_experts_per_head=n_experts_per_head,
                                     n_mhc=n_mhc)
-        self.moe_swiglu = MoESwiGLU(d_hidden, n_experts=n_ffn_experts, n_mhc=n_mhc,
-                                     top_prob=ffn_top_prob, max_k=ffn_max_k)
+        self.moe_swiglu = MoESwiGLU(d_hidden, n_heads=n_ffn_heads,
+                                     n_experts_per_head=n_experts_per_ffn_head, n_mhc=n_mhc)
 
         # Halting router
         self.router = HaltingRouter(d_hidden, n_mhc)
 
         # AttnRes: shared preH + final w + expert-averaged RMSNorm
-        self.attn_res_expert_scales = nn.Parameter(torch.ones(n_ffn_experts, d_hidden))
+        self.attn_res_expert_scales = nn.Parameter(torch.ones(n_ffn_heads * n_experts_per_ffn_head, d_hidden))
         self.preH_iter  = nn.Linear(n_mhc * d_hidden, d_hidden, bias=False)
         self.preH_final = nn.Linear(n_mhc * d_hidden, d_hidden, bias=False)
         self.w_final = nn.Parameter(torch.zeros(d_hidden))
@@ -634,10 +702,12 @@ class KDAPolicyNetwork(nn.Module):
     def _init_weights(self):
         depth = self.max_iterations * self.inner_steps
         scale = depth ** -0.5
-        nn.init.normal_(self.moa_kda.W_o.weight,
-                        std=scale * (2.0 / self.moa_kda.W_o.in_features) ** 0.5)
+        nn.init.normal_(self.moa_kda.W_o_w,
+                        std=scale * (2.0 / self.moa_kda.dv) ** 0.5)
         nn.init.normal_(self.moe_swiglu.swiglu_down_w,
                         std=scale * (2.0 / self.moe_swiglu.swiglu_down_w.shape[-1]) ** 0.5)
+        nn.init.normal_(self.moe_swiglu.W_o_w,
+                        std=scale * (2.0 / self.moe_swiglu.d) ** 0.5)
         nn.init.normal_(self.head_down.weight,
                         std=scale * (2.0 / self.head_down.in_features) ** 0.5)
         nn.init.normal_(self.preH_iter.weight,
@@ -716,7 +786,7 @@ class KDAPolicyNetwork(nn.Module):
 
             # ── Inner loop: INNER_STEPS × (MoA + MoE) ──
             mean_query = stream.new_zeros(B, T_total, d)
-            gate_moe_sum = stream.new_zeros(B, T_total, self.moe_swiglu.n_experts)
+            gate_moe_sum = stream.new_zeros(B, T_total, self.moe_swiglu.FE)
             for j in range(self.inner_steps):
                 attn_update, moa_lp = self.moa_kda(stream)
                 stream = attn_update

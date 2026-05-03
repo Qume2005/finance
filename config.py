@@ -43,7 +43,7 @@ DEPTH_PENALTY_COEFF = 0.1   # expected_depth 惩罚系数（对抗 backprop "永
 
 # ── 探索噪声 ──
 ROUTE_TEMP    = 2.0         # Q/KV 专家路由温度（>1 更随机，<1 更贪心）
-FFN_GUMBEL_TAU = 1.0        # FFN Gumbel 噪声强度（0=确定性，越大越随机）
+FFN_GUMBEL_TAU = 1.0        # FFN Gumbel 噪声强度（已弃用，保留兼容）
 HALT_TEMP     = 2.0         # 停机决策温度（>1 更随机，<1 更贪心）
 
 # MoA Attention
@@ -54,6 +54,5 @@ N_ATTN_HEADS = 3               # 注意力 Head 数
 N_EXPERTS_PER_HEAD = 8        # 每 Head 统一专家数（含零专家，expert 0 对 Q 为零）
 
 # MoE FFN
-N_FFN_EXPERTS = 48            # MoE 前馈专家数
-FFN_TOP_PROB  = 0.8
-FFN_MAX_K     = 6
+N_FFN_HEADS = 6              # MoE FFN 路由头数
+N_EXPERTS_PER_FFN_HEAD = 8   # 每头专家数（含零专家）
