@@ -46,6 +46,12 @@ def setup_distributed():
     else:
         rank, world_size, local_rank = 0, 1, 0
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+    # 非 rank-0：Ctrl+C 立即退出，避免卡在 NCCL 等待 torchrun SIGKILL
+    if rank != 0:
+        import signal
+        signal.signal(signal.SIGINT, lambda s, f: os._exit(0))
+
     return rank, world_size, local_rank, device
 
 
@@ -114,11 +120,7 @@ def main():
     if is_main:
         plot_training_curves(history, output_dir=OUTPUT_DIR)
 
-    # Barrier: ensure all ranks finish training
-    if world_size > 1:
-        dist.barrier()
-
-    # 非 rank-0：训练结束，直接退出
+    # 非 rank-0：训练结束直接退出（rank-0 独自评估，不需要 barrier）
     if not is_main:
         if world_size > 1:
             dist.destroy_process_group()
