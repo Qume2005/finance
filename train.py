@@ -122,6 +122,11 @@ def train_grpo(policy, ref_policy, train_feats, train_rets,
     if ckpt_files:
         ckpt_path = ckpt_files[-1]
         ckpt = torch.load(ckpt_path, map_location="cpu", weights_only=False)
+        # 兼容旧 checkpoint：q_router_w + kv_router_w → router_w
+        sd = ckpt["model"]
+        if "moa_kda.q_router_w" in sd:
+            sd["moa_kda.router_w"] = sd.pop("moa_kda.q_router_w")
+            sd.pop("moa_kda.kv_router_w", None)
         # checkpoint 保存时已去掉 _orig_mod. 前缀，直接加载
         raw_model.load_state_dict(ckpt["model"])
         muon_opt.load_state_dict(ckpt["muon_opt"])
@@ -269,8 +274,7 @@ def train_grpo(policy, ref_policy, train_feats, train_rets,
 
         if ORTHO_COEFF > 0:
             ortho_loss = torch.tensor(0.0, device=feats.device)
-            for W in [raw_model.moa_kda.q_router_w,
-                      raw_model.moa_kda.kv_router_w,
+            for W in [raw_model.moa_kda.router_w,
                       raw_model.moe_swiglu.router_w,
                       raw_model.router.proj.weight]:
                 W_flat = W.reshape(-1, W.shape[-1])
