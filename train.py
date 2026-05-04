@@ -21,6 +21,7 @@ from config import (SEED, EPISODE_LEN, G_SAMPLES, LAMBDA_REWARD, REWARD_SCALE,
                     N_ATTN_HEADS_PER_CARD, N_FFN_HEADS_PER_CARD,
                     HEAD_ROTATION_INTERVAL)
 from muon import NewtonMuon
+from torch.cuda.amp import autocast as fp16_autocast, GradScaler
 
 
 # ────────────────── Head-wise expert parallelism ──────────────────
@@ -108,6 +109,7 @@ def train_grpo(policy, ref_policy, train_feats, train_rets,
         torch.optim.lr_scheduler.CosineAnnealingLR(opt, N_EPISODES)
         for opt in optimizers
     ]
+    scaler = GradScaler()
 
     # Uncompiled model for Newton-Muon ZZ^T collection (hooks must NOT stay on during compiled forward)
     if raw_model is None:
@@ -134,6 +136,8 @@ def train_grpo(policy, ref_policy, train_feats, train_rets,
         start_ep = ckpt["step"] + 1
         _global_step[0] = start_ep
         history = ckpt.get("history", history)
+        if "scaler" in ckpt:
+            scaler.load_state_dict(ckpt["scaler"])
         if is_main:
             print(f"Resumed from {ckpt_path} (step {ckpt['step']})")
         # fast-forward schedulers to correct lr
@@ -223,12 +227,13 @@ def train_grpo(policy, ref_policy, train_feats, train_rets,
         # ── ref_policy forward 先算（no_grad，峰值低）──
         ref_logits_cache = None
         if BETA_KL > 0:
-            with torch.no_grad():
+            with torch.no_grad(), fp16_autocast():
                 ref_logits_cache = sliding_forward(ref_policy, feats)[0]
 
         # ── 单次 forward：同时用于采样和梯度 ──
-        logits, exit_iters, route_lp, exp_depth = sliding_forward(
-            policy, feats, attn_mask, ffn_mask)
+        with fp16_autocast():
+            logits, exit_iters, route_lp, exp_depth = sliding_forward(
+                policy, feats, attn_mask, ffn_mask)
         log_probs = F.log_softmax(logits.float(), dim=-1)
 
         # 采样 actions（detached，不影响梯度）
@@ -296,7 +301,9 @@ def train_grpo(policy, ref_policy, train_feats, train_rets,
         loss = loss_clip + loss_route_reinforce + BETA_KL * kl - ENTROPY_COEFF * entropy + ortho_loss + loss_depth
         for opt in optimizers:
             opt.zero_grad()
-        loss.backward()
+        scaler.scale(loss).backward()
+        for opt in optimizers:
+            scaler.unscale_(opt)
         # 梯度缩放：expert 参数只有 1/world_size 的正确值
         if world_size > 1 and head_masks_active:
             for name, param in policy.named_parameters():
@@ -305,7 +312,8 @@ def train_grpo(policy, ref_policy, train_feats, train_rets,
                         param.grad *= world_size
         nn.utils.clip_grad_norm_(policy.parameters(), 1.0)
         for opt in optimizers:
-            opt.step()
+            scaler.step(opt)
+        scaler.update()
         for sch in schedulers:
             sch.step()
 
@@ -329,6 +337,7 @@ def train_grpo(policy, ref_policy, train_feats, train_rets,
             "model": {k.replace("_orig_mod.", ""): v for k, v in raw_model.state_dict().items()},
             "muon_opt": muon_opt.state_dict(),
             "sgd_opt": sgd_opt.state_dict(),
+            "scaler": scaler.state_dict(),
             "history": history,
         }, tmp_path)
         os.replace(tmp_path, ckpt_path)
