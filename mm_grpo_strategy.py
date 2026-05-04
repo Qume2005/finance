@@ -115,27 +115,27 @@ def main():
     if is_main:
         plot_training_curves(history, output_dir=OUTPUT_DIR)
 
-    # 非 rank-0：训练结束直接退出（rank-0 独自评估）
-    if not is_main:
-        os._exit(0)
+    # 多卡：训练结束直接退出（评估用单卡单独跑）
+    if world_size > 1:
+        if not is_main:
+            os._exit(0)
+        else:
+            cleanup_distributed()
+            return
 
-    # ──── Step 4: Test data + Evaluate (rank 0 only) ────
+    # ──── Step 4: Test data + Evaluate (单卡) ────
     raw_policy.eval()
     save_model(raw_policy, os.path.join(OUTPUT_DIR, "policy.pt"))
 
-    # generate test data now — only rank 0
     test_data = prepare_test_data(device, data["feat_mean"], data["feat_std"])
     plot_prices(test_data["prices_list"], output_dir=OUTPUT_DIR)
 
     results = run_backtest(raw_policy, test_data["test_feats"], test_data["test_rets"])
     plot_results(results, output_dir=OUTPUT_DIR)
 
-    # Export CSV + JSON
     export_results(results, history)
 
     print_conclusions()
-
-    cleanup_distributed()
 
 
 if __name__ == "__main__":
