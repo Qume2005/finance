@@ -15,8 +15,49 @@ from config import (SEED, EPISODE_LEN, G_SAMPLES, LAMBDA_REWARD, REWARD_SCALE,
                     WEIGHT_DECAY, SAVE_EVERY, OUTPUT_DIR, ENTROPY_COEFF,
                     MAX_ITERATIONS, MIN_ITERATIONS,
                     ITER_REWARD_START, ITER_REWARD_END, ORTHO_COEFF,
-                    DEPTH_PENALTY_COEFF)
+                    DEPTH_PENALTY_COEFF,
+                    N_ATTN_HEADS, N_FFN_HEADS,
+                    N_ATTN_HEADS_PER_CARD, N_FFN_HEADS_PER_CARD,
+                    HEAD_ROTATION_INTERVAL)
 from muon import NewtonMuon
+
+
+# ────────────────── Head-wise expert parallelism ──────────────────
+
+_ACTION_HEAD_SUFFIXES = ('head_down.weight', 'head_gate.weight', 'head_up.weight')
+
+
+def compute_head_masks(step, world_size, rank):
+    """Return (attn_mask, ffn_mask) — bool tensors, True = gradient on this GPU."""
+    if world_size <= 1:
+        return None, None
+
+    n_attn = N_ATTN_HEADS
+    n_ffn = N_FFN_HEADS
+    a_per = N_ATTN_HEADS_PER_CARD or n_attn
+    f_per = N_FFN_HEADS_PER_CARD or n_ffn
+
+    if a_per >= n_attn and f_per >= n_ffn:
+        return None, None                                  # 退化为普通 DDP
+
+    epoch = step // HEAD_ROTATION_INTERVAL if HEAD_ROTATION_INTERVAL > 0 else 0
+
+    # 确定性随机排列（所有 GPU 同 seed → 同排列 → 各取不同 chunk）
+    rng = torch.Generator().manual_seed(SEED + epoch)
+    attn_perm = torch.randperm(n_attn, generator=rng)
+    rng.manual_seed(SEED + epoch + 10000)
+    ffn_perm = torch.randperm(n_ffn, generator=rng)
+
+    def make_mask(perm, n_total, n_per_card):
+        chunk = min(n_per_card, (n_total + world_size - 1) // world_size)
+        start = rank * chunk
+        end = min(start + chunk, n_total)
+        mask = torch.zeros(n_total, dtype=torch.bool)
+        if start < n_total:
+            mask[perm[start:end]] = True
+        return mask
+
+    return make_mask(attn_perm, n_attn, a_per), make_mask(ffn_perm, n_ffn, f_per)
 
 
 def compute_bh_metrics(daily_returns):
@@ -112,7 +153,7 @@ def train_grpo(policy, ref_policy, train_feats, train_rets,
         r_batch = torch.stack([train_rets[idx.item()][:seq_len] for idx in indices]).to(rank, non_blocking=True)
         return f_batch, r_batch
 
-    def sliding_forward(model, feats):
+    def sliding_forward(model, feats, attn_head_mask=None, ffn_head_mask=None):
         """Parallel window forward — all windows as one batch."""
         B, T, D = feats.shape
         n_w = (T + EPISODE_LEN - 1) // EPISODE_LEN
@@ -123,7 +164,8 @@ def train_grpo(policy, ref_policy, train_feats, train_rets,
         # (B, n_w*EPISODE_LEN, D) → (B*n_w, EPISODE_LEN, D)
         windows = feats.reshape(B * n_w, EPISODE_LEN, D)
 
-        logits, exit_iters, route_lp, expected_depth = model(windows)
+        logits, exit_iters, route_lp, expected_depth = model(
+            windows, attn_head_mask=attn_head_mask, ffn_head_mask=ffn_head_mask)
 
         # logits: (B*n_w, n_actions) — one action per window, predicts NEXT window
         result = logits.reshape(B, n_w, -1)                  # (B, n_w, n_actions)
@@ -166,10 +208,15 @@ def train_grpo(policy, ref_policy, train_feats, train_rets,
             muon_opt._hooks = []
             muon_opt.update_preconditioner()
 
+        # Head-wise expert parallelism masks
+        attn_mask, ffn_mask = compute_head_masks(_global_step[0], world_size, rank)
+        head_masks_active = (attn_mask is not None or ffn_mask is not None)
+
         bh_sharpe, bh_return = compute_bh_metrics(rets)
 
         # ── 单次 forward：同时用于采样和梯度 ──
-        logits, exit_iters, route_lp, exp_depth = sliding_forward(policy, feats)
+        logits, exit_iters, route_lp, exp_depth = sliding_forward(
+            policy, feats, attn_mask, ffn_mask)
         log_probs = F.log_softmax(logits.float(), dim=-1)
 
         # 采样 actions（detached，不影响梯度）
@@ -241,6 +288,12 @@ def train_grpo(policy, ref_policy, train_feats, train_rets,
         for opt in optimizers:
             opt.zero_grad()
         loss.backward()
+        # 梯度缩放：expert 参数只有 1/world_size 的正确值
+        if world_size > 1 and head_masks_active:
+            for name, param in policy.named_parameters():
+                if param.grad is not None:
+                    if not any(name.endswith(s) for s in _ACTION_HEAD_SUFFIXES):
+                        param.grad *= world_size
         nn.utils.clip_grad_norm_(policy.parameters(), 1.0)
         for opt in optimizers:
             opt.step()
