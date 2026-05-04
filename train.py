@@ -4,6 +4,7 @@ import os
 import glob
 import time
 import threading
+import signal
 import numpy as np
 import torch
 import torch.nn as nn
@@ -306,6 +307,30 @@ def train_grpo(policy, ref_policy, train_feats, train_rets,
 
         return loss.item(), rw.mean().item(), rw.std().item()
 
+    # ── Signal handler for graceful shutdown (rank 0) ──
+    _graceful = [False]
+    if is_main:
+        def _sig_handler(signum, frame):
+            _graceful[0] = True
+        signal.signal(signal.SIGINT, _sig_handler)
+        signal.signal(signal.SIGTERM, _sig_handler)
+
+    def _save_ckpt(ep):
+        ckpt_path = os.path.join(OUTPUT_DIR, f"ckpt_{ep}.pt")
+        tmp_path = ckpt_path + ".tmp"
+        torch.save({
+            "step": ep,
+            "model": {k.replace("_orig_mod.", ""): v for k, v in raw_model.state_dict().items()},
+            "muon_opt": muon_opt.state_dict(),
+            "sgd_opt": sgd_opt.state_dict(),
+            "history": history,
+        }, tmp_path)
+        os.replace(tmp_path, ckpt_path)
+        for old in glob.glob(os.path.join(OUTPUT_DIR, "ckpt_*.pt")):
+            if old != ckpt_path:
+                os.remove(old)
+        return ckpt_path
+
     # ── Training loop ──
     if is_main:
         os.makedirs(OUTPUT_DIR, exist_ok=True)
@@ -315,9 +340,15 @@ def train_grpo(policy, ref_policy, train_feats, train_rets,
               + (f"  [resume from step {start_ep-1}]" if start_ep > 1 else ""))
     t0 = time.time()
 
+    last_ep = start_ep - 1
+    interrupted = False
     try:
         for ep in range(start_ep, N_EPISODES + 1):
+            if _graceful[0]:
+                interrupted = True
+                break
             loss, rm, rs = grpo_step()
+            last_ep = ep
             if is_main:
                 history["loss"].append(loss)
                 history["reward_mean"].append(rm)
@@ -328,40 +359,32 @@ def train_grpo(policy, ref_policy, train_feats, train_rets,
                           f"reward={rm:+.4f}±{rs:.4f}  lr={schedulers[0].get_last_lr()[0]:.2e}  "
                           f"[{elapsed:.0f}s]")
                 if SAVE_EVERY and ep % SAVE_EVERY == 0:
-                    ckpt_path = os.path.join(OUTPUT_DIR, f"ckpt_{ep}.pt")
-                    tmp_path = ckpt_path + ".tmp"
-                    torch.save({
-                        "step": ep,
-                        "model": {k.replace("_orig_mod.", ""): v for k, v in raw_model.state_dict().items()},
-                        "muon_opt": muon_opt.state_dict(),
-                        "sgd_opt": sgd_opt.state_dict(),
-                        "history": history,
-                    }, tmp_path)
-                    os.replace(tmp_path, ckpt_path)
-                    # 删旧 checkpoint（新 checkpoint 已安全写入）
-                    for old in glob.glob(os.path.join(OUTPUT_DIR, "ckpt_*.pt")):
-                        if old != ckpt_path:
-                            os.remove(old)
+                    ckpt_path = _save_ckpt(ep)
                     print(f"  Checkpoint saved → {ckpt_path}")
     except KeyboardInterrupt:
+        interrupted = True
+    except RuntimeError as e:
+        # 多卡时非 rank-0 退出会导致 NCCL 错误，正常保存 checkpoint
+        if world_size > 1 and ("NCCL" in str(e) or "CUDA" in str(e)):
+            interrupted = True
+        else:
+            raise
+    finally:
+        if is_main and interrupted and last_ep >= start_ep:
+            try:
+                ckpt_path = _save_ckpt(last_ep)
+                print(f"\n  Interrupted at step {last_ep}. Checkpoint saved → {ckpt_path}")
+            except Exception:
+                print(f"\n  Interrupted at step {last_ep}. Checkpoint save FAILED.")
+        # 恢复默认信号处理器，避免后续 Ctrl+C 无反应
         if is_main:
-            last_ep = ep if 'ep' in dir() else start_ep
-            ckpt_path = os.path.join(OUTPUT_DIR, f"ckpt_{last_ep}.pt")
-            tmp_path = ckpt_path + ".tmp"
-            torch.save({
-                "step": last_ep,
-                "model": {k.replace("_orig_mod.", ""): v for k, v in raw_model.state_dict().items()},
-                "muon_opt": muon_opt.state_dict(),
-                "sgd_opt": sgd_opt.state_dict(),
-                "history": history,
-            }, tmp_path)
-            os.replace(tmp_path, ckpt_path)
-            for old in glob.glob(os.path.join(OUTPUT_DIR, "ckpt_*.pt")):
-                if old != ckpt_path:
-                    os.remove(old)
-            print(f"\n  Interrupted at step {last_ep}. Checkpoint saved → {ckpt_path}")
+            signal.signal(signal.SIGINT, signal.default_int_handler)
+            signal.signal(signal.SIGTERM, signal.SIG_DFL)
 
     if is_main:
-        print(f"Training done in {time.time()-t0:.1f}s")
+        if interrupted:
+            print(f"Training interrupted at step {last_ep} ({time.time()-t0:.1f}s)")
+        else:
+            print(f"Training done in {time.time()-t0:.1f}s")
 
     return history
