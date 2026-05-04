@@ -80,8 +80,11 @@ def create_models(device, is_main, world_size, local_rank):
 
     # DDP: wrap before compile
     if world_size > 1:
+        from config import N_ATTN_HEADS_PER_CARD, N_FFN_HEADS_PER_CARD
+        has_head_mask = ((N_ATTN_HEADS_PER_CARD or N_ATTN_HEADS) < N_ATTN_HEADS
+                         or (N_FFN_HEADS_PER_CARD or N_FFN_HEADS) < N_FFN_HEADS)
         policy = DDP(policy, device_ids=[local_rank],
-                      find_unused_parameters=True)
+                      find_unused_parameters=has_head_mask)
 
     if is_main:
         print("Model ready (DDP).")
