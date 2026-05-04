@@ -15,6 +15,28 @@ from config import (D_HIDDEN, D_KEY, D_ATTN, N_ATTN_HEADS, N_EXPERTS_PER_HEAD,
 
 # ────────────────── Utilities ──────────────────
 
+class _RMSNorm(nn.Module):
+    """RMSNorm that preserves input dtype (handles fp16 correctly)."""
+    def __init__(self, d, eps=1e-8):
+        super().__init__()
+        self.eps = eps
+        self.weight = nn.Parameter(torch.ones(d))
+
+    def forward(self, x):
+        return x * torch.rsqrt(x.float().pow(2).mean(-1, keepdim=True).add(self.eps)).to(x.dtype) * self.weight
+
+
+def _einsum(eq, *operands):
+    """Einsum with fp16 matmul (V100 Tensor Core), fp32 result."""
+    ops = [op.half() if op.is_floating_point() else op for op in operands]
+    return torch.einsum(eq, *ops).float()
+
+
+def _bmm(a, b):
+    """Batched matmul with fp16 (V100 Tensor Core), fp32 result."""
+    return torch.bmm(a.half(), b.half()).float()
+
+
 def sinkhorn_knopp(M, n_iters=6):
     """Project (..., n, n) to doubly stochastic matrix."""
     M = torch.exp(M)
@@ -54,7 +76,7 @@ class MHC(nn.Module):
         super().__init__()
         self.n = n
         nd = n * d_hidden
-        self.norm = nn.RMSNorm(nd)
+        self.norm = _RMSNorm(nd)
         self.phi_pre  = nn.Linear(nd, n, bias=False)
         self.phi_post = nn.Linear(nd, n, bias=False)
         self.phi_res  = nn.Linear(nd, n * n, bias=False)
@@ -123,15 +145,15 @@ class BatchedMHC(nn.Module):
         # phi_pre: (K, B, T, nd) @ (K, n, nd) → (K, B, T, n)
         H_pre = torch.sigmoid(
             self.alpha_pre[active_idx].view(K, 1, 1, 1)
-            * torch.einsum('kbtd,knd->kbtn', x, self.phi_pre_w[active_idx])
+            * _einsum('kbtd,knd->kbtn', x, self.phi_pre_w[active_idx])
             + self.b_pre[active_idx].unsqueeze(1).unsqueeze(1))
 
         H_post = 2 * torch.sigmoid(
             self.alpha_post[active_idx].view(K, 1, 1, 1)
-            * torch.einsum('kbtd,knd->kbtn', x, self.phi_post_w[active_idx])
+            * _einsum('kbtd,knd->kbtn', x, self.phi_post_w[active_idx])
             + self.b_post[active_idx].unsqueeze(1).unsqueeze(1))
 
-        res_einsum = torch.einsum('kbtd,knd->kbtn', x, self.phi_res_w[active_idx])
+        res_einsum = _einsum('kbtd,knd->kbtn', x, self.phi_res_w[active_idx])
         res_flat = res_einsum.reshape(K, B, T, n, n)
         H_res_raw = (
             self.alpha_res[active_idx].view(K, 1, 1, 1, 1)
@@ -148,12 +170,12 @@ class BatchedMHC(nn.Module):
 def _kda_step(q_t, k_t, v_t, alpha_t, beta_t, S):
     """Single KDA recursion step — compiled as a small graph."""
     aS = alpha_t.unsqueeze(-1) * S
-    kt_aS = torch.einsum('bd,bde->be', k_t, aS)
+    kt_aS = _einsum('bd,bde->be', k_t, aS)
     bt = beta_t.unsqueeze(-1)
     S = (aS
-         - bt * torch.bmm(k_t.unsqueeze(2), kt_aS.unsqueeze(1))
-         + bt * torch.bmm(k_t.unsqueeze(2), v_t.unsqueeze(1)))
-    out_t = torch.einsum('bd,bde->be', q_t, S)
+         - bt * _bmm(k_t.unsqueeze(2), kt_aS.unsqueeze(1))
+         + bt * _bmm(k_t.unsqueeze(2), v_t.unsqueeze(1)))
+    out_t = _einsum('bd,bde->be', q_t, S)
     return out_t, S
 
 
@@ -259,7 +281,7 @@ class MoAKDALayer(nn.Module):
 
         H_res_k, H_pre_k, H_post_k = self.batched_mhc(stream, fi)
         stream_exp = stream.unsqueeze(0).expand(K, -1, -1, -1, -1)
-        h_e = torch.einsum('kbtn,kbntd->kbtd', H_pre_k, stream_exp)
+        h_e = _einsum('kbtn,kbntd->kbtd', H_pre_k, stream_exp)
 
         # Batched RMSNorm
         nw = self.batched_norm_w[fi]
@@ -273,46 +295,46 @@ class MoAKDALayer(nn.Module):
 
         # ── Q projection ──
         lA_q = self.lora_A_q[fi]; lB_q = self.lora_B_q[fi]
-        delta_q = torch.einsum(
+        delta_q = _einsum(
             'kbtr,krd->kbtd',
-            F.silu(torch.einsum('kbtd,kdr->kbtr', h_e, lA_q)), lB_q)
+            F.silu(_einsum('kbtd,kdr->kbtr', h_e, lA_q)), lB_q)
         Wq = self.W_q_w[hi]
-        q_proj = torch.einsum('kbtd,kod->kbto', h_e, Wq)
+        q_proj = _einsum('kbtd,kod->kbto', h_e, Wq)
         q_out = self._apply_pope(
             F.normalize(q_proj + delta_q, dim=-1), positions, True)
 
         # ── K projection ──
         lA_k = self.lora_A_k[fi]; lB_k = self.lora_B_k[fi]
-        delta_k = torch.einsum(
+        delta_k = _einsum(
             'kbtr,krd->kbtd',
-            F.silu(torch.einsum('kbtd,kdr->kbtr', h_e, lA_k)), lB_k)
+            F.silu(_einsum('kbtd,kdr->kbtr', h_e, lA_k)), lB_k)
         Wk = self.W_k_w[hi]
-        k_proj = torch.einsum('kbtd,kod->kbto', h_e, Wk)
+        k_proj = _einsum('kbtd,kod->kbto', h_e, Wk)
         k_out = self._apply_pope(
             F.normalize(k_proj + delta_k, dim=-1), positions, False)
 
         # ── V projection ──
         lA_v = self.lora_A_v[fi]; lB_v = self.lora_B_v[fi]
-        delta_v = torch.einsum(
+        delta_v = _einsum(
             'kbtr,krd->kbtd',
-            F.silu(torch.einsum('kbtd,kdr->kbtr', h_e, lA_v)), lB_v)
+            F.silu(_einsum('kbtd,kdr->kbtr', h_e, lA_v)), lB_v)
         Wv = self.W_v_w[hi]
         v_out = F.silu(
-            torch.einsum('kbtd,kod->kbto', h_e, Wv) + delta_v)
+            _einsum('kbtd,kod->kbto', h_e, Wv) + delta_v)
 
         # ── Alpha, Beta ──
-        a_mid = torch.einsum('kbtd,kde->kbte', h_e, self.alpha_up_w[fi])
-        alpha_out = torch.sigmoid(torch.einsum(
+        a_mid = _einsum('kbtd,kde->kbte', h_e, self.alpha_up_w[fi])
+        alpha_out = torch.sigmoid(_einsum(
             'kbte,ked->kbtd', F.silu(a_mid), self.alpha_down_w[fi]))
-        b_mid = torch.einsum('kbtd,kde->kbte', h_e, self.beta_up_w[fi])
-        beta_out = torch.sigmoid(torch.einsum(
+        b_mid = _einsum('kbtd,kde->kbte', h_e, self.beta_up_w[fi])
+        beta_out = torch.sigmoid(_einsum(
             'kbte,ked->kbtd', F.silu(b_mid), self.beta_down_w[fi]))
 
         # ── Gates ──
-        pre_gate_out = F.silu(torch.einsum(
+        pre_gate_out = F.silu(_einsum(
             'kbtd,kde->kbte', h_e, self.W_pre_w[fi]))
-        pg_mid = torch.einsum('kbtd,kde->kbte', h_e, self.W_pg1_w[fi])
-        pg_out = torch.sigmoid(torch.einsum(
+        pg_mid = _einsum('kbtd,kde->kbte', h_e, self.W_pg1_w[fi])
+        pg_out = torch.sigmoid(_einsum(
             'kbte,ked->kbtd', F.silu(pg_mid), self.W_pg2_w[fi]))
 
         # ── Scatter-add to per-head buffers ──
@@ -348,10 +370,10 @@ class MoAKDALayer(nn.Module):
         route_input = stream.mean(dim=1)                   # (B, T, d)
 
         # ════════════════ 1. Unified routing (all heads, always with grad) ════════════════
-        logits = torch.einsum('btd,hed->hbte', route_input, self.router_w)
+        logits = _einsum('btd,hed->hbte', route_input, self.router_w)
         logits = logits.clamp(-10, 10)                      # (H, B, T, E)
 
-        probs = F.softmax(logits / ROUTE_TEMP, dim=-1).to(stream.dtype)
+        probs = F.softmax(logits / ROUTE_TEMP, dim=-1)
 
         if self.training:
             sel = torch.multinomial(probs.reshape(-1, E), 1).reshape(H, B, T)
@@ -443,14 +465,14 @@ class MoAKDALayer(nn.Module):
         h_idx = torch.arange(H, device=stream.device).view(H, 1, 1)
         flat_idx = h_idx * E + sel                          # (H, B, T)
         W_o_token = self.W_o_w[flat_idx]                   # (H, B, T, d, dv)
-        proj_he = torch.einsum('hbtv,hbtdv->hbtd', gated_he, W_o_token)
+        proj_he = _einsum('hbtv,hbtdv->hbtd', gated_he, W_o_token)
         result_he = proj_he * acc_post_gate                # (H, B, T, d)
         result = result_he.sum(0)                          # (B, T, d)
 
         H_res_avg  = acc_H_res / H
         H_post_avg = acc_H_post / H
-        res = torch.einsum('btij,bjtd->bitd', H_res_avg, stream)
-        post = torch.einsum('btn,btd->bntd', H_post_avg, result)
+        res = _einsum('btij,bjtd->bitd', H_res_avg, stream)
+        post = _einsum('btn,btd->bntd', H_post_avg, result)
         stream_update = res + post
 
         return stream_update, route_lp
@@ -463,7 +485,7 @@ class SwiGLU(nn.Module):
     def __init__(self, d_input):
         super().__init__()
         d_ffn = int(d_input * 1.618)
-        self.norm = nn.RMSNorm(d_input)
+        self.norm = _RMSNorm(d_input)
         self.wd = nn.Linear(d_input, d_input, bias=False)
         self.wu = nn.Linear(d_input, d_input, bias=False)
         self.gate = nn.Linear(d_input, d_ffn, bias=False)
@@ -538,7 +560,7 @@ class MoESwiGLU(nn.Module):
 
         H_res_k, H_pre_k, H_post_k = self.batched_mhc(stream, fi)
         stream_exp = stream.unsqueeze(0).expand(ki.shape[0], -1, -1, -1, -1)
-        h_e = torch.einsum('kbtn,kbntd->kbtd', H_pre_k, stream_exp)
+        h_e = _einsum('kbtn,kbntd->kbtd', H_pre_k, stream_exp)
 
         nw = self.batched_norm_w[fi]
         rms = h_e.float().pow(2).mean(-1, keepdim=True).add(1e-8).rsqrt().to(h_e.dtype)
@@ -550,21 +572,21 @@ class MoESwiGLU(nn.Module):
         eff = (prob_k + (mask_k.to(prob_k.dtype) - prob_k).detach()).unsqueeze(-1)
 
         # SwiGLU
-        wd_out = torch.einsum('kbtd,kod->kbto', h_e, self.swiglu_wd_w[fi])
-        g = torch.sigmoid(torch.einsum('kbtd,kod->kbto', F.silu(wd_out), self.swiglu_wu_w[fi]))
-        gate_out = torch.einsum('kbtd,kod->kbto', h_e, self.swiglu_gate_w[fi])
-        up_out = torch.einsum('kbtd,kod->kbto', h_e, self.swiglu_up_w[fi])
-        swiglu_out = g * torch.einsum('kbtf,kof->kbto', F.silu(gate_out) * up_out, self.swiglu_down_w[fi])
+        wd_out = _einsum('kbtd,kod->kbto', h_e, self.swiglu_wd_w[fi])
+        g = torch.sigmoid(_einsum('kbtd,kod->kbto', F.silu(wd_out), self.swiglu_wu_w[fi]))
+        gate_out = _einsum('kbtd,kod->kbto', h_e, self.swiglu_gate_w[fi])
+        up_out = _einsum('kbtd,kod->kbto', h_e, self.swiglu_up_w[fi])
+        swiglu_out = g * _einsum('kbtf,kof->kbto', F.silu(gate_out) * up_out, self.swiglu_down_w[fi])
 
         eff_out = eff * swiglu_out
 
         # PreGate
-        pre_gate_out = F.silu(torch.einsum('kbtd,kde->kbte', h_e, self.W_pre_w[fi]))
+        pre_gate_out = F.silu(_einsum('kbtd,kde->kbte', h_e, self.W_pre_w[fi]))
         eff_pg = eff * pre_gate_out
 
         # PostGate
-        pg_mid = torch.einsum('kbtd,kde->kbte', h_e, self.W_pg1_w[fi])
-        pg_out = torch.sigmoid(torch.einsum('kbte,ked->kbtd', F.silu(pg_mid), self.W_pg2_w[fi]))
+        pg_mid = _einsum('kbtd,kde->kbte', h_e, self.W_pg1_w[fi])
+        pg_out = torch.sigmoid(_einsum('kbte,ked->kbtd', F.silu(pg_mid), self.W_pg2_w[fi]))
         eff_post = eff * pg_out
 
         # Scatter-accumulate to per-head buffers
@@ -589,8 +611,8 @@ class MoESwiGLU(nn.Module):
         route_input = stream.mean(dim=1)                   # (B, T, d)
 
         # ════════════════ 1. Routing (all heads, always with grad) ════════════════
-        logits = torch.einsum('btd,fed->fbte', route_input, self.router_w).clamp(-10, 10)
-        probs = F.softmax(logits / ROUTE_TEMP, dim=-1).to(stream.dtype)     # (nf, B, T, ne)
+        logits = _einsum('btd,fed->fbte', route_input, self.router_w).clamp(-10, 10)
+        probs = F.softmax(logits / ROUTE_TEMP, dim=-1)     # (nf, B, T, ne)
 
         if self.training:
             sel = torch.multinomial(probs.reshape(-1, ne), 1).reshape(nf, B, T)
@@ -674,15 +696,15 @@ class MoESwiGLU(nn.Module):
         gated = gated * sel_probs.unsqueeze(-1)            # × routing prob
         flat_idx = f_arange * ne + sel                     # (nf, B, T)
         W_o_token = self.W_o_w[flat_idx]                   # (nf, B, T, d, d)
-        proj = torch.einsum('hbtd,hbted->hbte', gated, W_o_token)  # (nf, B, T, d)
+        proj = _einsum('hbtd,hbted->hbte', gated, W_o_token)  # (nf, B, T, d)
         result_he = proj * acc_post_gate                   # (nf, B, T, d)
         result = result_he.sum(0)                          # (B, T, d)
 
         # mHC
         H_res_avg = acc_H_res / nf
         H_post_avg = acc_H_post / nf
-        res = torch.einsum('btij,bjtd->bitd', H_res_avg, stream)
-        post = torch.einsum('btn,btd->bntd', H_post_avg, result)
+        res = _einsum('btij,bjtd->bitd', H_res_avg, stream)
+        post = _einsum('btn,btd->bntd', H_post_avg, result)
         stream_update = res + post
 
         return stream_update, gate_moe, route_lp
@@ -696,7 +718,7 @@ class HaltingRouter(nn.Module):
         super().__init__()
         self.n = n_mhc
         nd = n_mhc * d_hidden
-        self.norm = nn.RMSNorm(nd)
+        self.norm = _RMSNorm(nd)
         self.phi_pre = nn.Linear(nd, n_mhc, bias=False)
         self.b_pre = nn.Parameter(torch.zeros(n_mhc))
         self.swiglu = SwiGLU(d_hidden)
@@ -743,7 +765,7 @@ class KDAPolicyNetwork(nn.Module):
         self.d = d_hidden
 
         self.inp_proj = nn.Sequential(
-            nn.Linear(d_input, d_hidden), nn.SiLU(), nn.RMSNorm(d_hidden))
+            nn.Linear(d_input, d_hidden), nn.SiLU(), _RMSNorm(d_hidden))
 
         # MoA-KDA + MoE-SwiGLU
         self.moa_kda = MoAKDALayer(d_hidden, d_key=d_key, d_attn=d_attn,
@@ -804,11 +826,11 @@ class KDAPolicyNetwork(nn.Module):
             scale = (gate_moe @ self.attn_res_expert_scales) / weights  # (B,T,d)
         K = V / (rms + 1e-8) * scale
         if w_l.dim() == 1:
-            logits = torch.einsum('d,lbtd->lbt', w_l, K)
+            logits = _einsum('d,lbtd->lbt', w_l, K)
         else:                                             # (B, T, d) per-token
-            logits = torch.einsum('btd,lbtd->lbt', w_l, K)
+            logits = _einsum('btd,lbtd->lbt', w_l, K)
         alpha = logits.softmax(0)
-        return torch.einsum('lbt,lbtd->btd', alpha, V)
+        return _einsum('lbt,lbtd->btd', alpha, V)
 
     @torch.compiler.disable
     def _loop(self, stream, acc, attn_head_mask=None, ffn_head_mask=None):
@@ -837,16 +859,16 @@ class KDAPolicyNetwork(nn.Module):
         for i in range(self.max_iterations):
             # ── Halting decision ──
             logits = self.router(stream).clamp(-10, 10)           # (B, 2)
-            soft = F.softmax(logits / HALT_TEMP, dim=-1).to(stream.dtype)  # (B, 2) [continue, exit]
+            soft = F.softmax(logits / HALT_TEMP, dim=-1)  # (B, 2) [continue, exit]
 
             # Accumulate expected depth (for compute cost penalty)
             expected_depth = expected_depth + soft[:, 0]
 
             if self.training:
-                should_continue = (i < target_depths).to(stream.dtype)
+                should_continue = (i < target_depths).float()
                 gate = soft[:, 0] + (should_continue - soft[:, 0]).detach()
             else:
-                gate = (logits.argmax(dim=-1) == 0).to(stream.dtype)
+                gate = (logits.argmax(dim=-1) == 0).float()
 
             if i < self.min_iterations:
                 gate = torch.ones(B, device=stream.device)
@@ -877,7 +899,7 @@ class KDAPolicyNetwork(nn.Module):
                 route_lp_total = route_lp_total + moe_lp.sum(-1)
                 route_lp_count += 1
 
-                mean_query = mean_query + torch.einsum(
+                mean_query = mean_query + _einsum(
                     'bte,ed->btd', gate_moe, self.moe_swiglu.w_experts)
                 gate_moe_sum = gate_moe_sum + gate_moe
             mean_query = mean_query / self.inner_steps

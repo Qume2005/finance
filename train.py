@@ -21,7 +21,7 @@ from config import (SEED, EPISODE_LEN, G_SAMPLES, LAMBDA_REWARD, REWARD_SCALE,
                     N_ATTN_HEADS_PER_CARD, N_FFN_HEADS_PER_CARD,
                     HEAD_ROTATION_INTERVAL)
 from muon import NewtonMuon
-from torch.cuda.amp import autocast as fp16_autocast, GradScaler
+from torch.cuda.amp import GradScaler
 
 
 # ────────────────── Head-wise expert parallelism ──────────────────
@@ -129,8 +129,9 @@ def train_grpo(policy, ref_policy, train_feats, train_rets,
         if "moa_kda.q_router_w" in sd:
             sd["moa_kda.router_w"] = sd.pop("moa_kda.q_router_w")
             sd.pop("moa_kda.kv_router_w", None)
-        # checkpoint 保存时已去掉 _orig_mod. 前缀，直接加载
-        raw_model.load_state_dict(ckpt["model"])
+        # 兼容旧 checkpoint 的 _orig_mod. 前缀
+        raw_model.load_state_dict({k.replace("_orig_mod.", ""): v
+                                    for k, v in ckpt["model"].items()})
         muon_opt.load_state_dict(ckpt["muon_opt"])
         sgd_opt.load_state_dict(ckpt["sgd_opt"])
         start_ep = ckpt["step"] + 1
@@ -144,14 +145,6 @@ def train_grpo(policy, ref_policy, train_feats, train_rets,
         for _ in range(ckpt["step"]):
             for sch in schedulers:
                 sch.step()
-
-    # ── 加载完 checkpoint 后再编译（避免 _orig_mod. key 不匹配）──
-    raw_model.router = torch.compile(raw_model.router)
-    raw_model._head = torch.compile(raw_model._head)
-    raw_model.inp_proj = torch.compile(raw_model.inp_proj)
-    ref_policy.router = torch.compile(ref_policy.router)
-    ref_policy._head = torch.compile(ref_policy._head)
-    ref_policy.inp_proj = torch.compile(ref_policy.inp_proj)
 
     def sample_series_batch():
         """Sample full training series from CPU, transfer to GPU."""
@@ -227,13 +220,12 @@ def train_grpo(policy, ref_policy, train_feats, train_rets,
         # ── ref_policy forward 先算（no_grad，峰值低）──
         ref_logits_cache = None
         if BETA_KL > 0:
-            with torch.no_grad(), fp16_autocast():
+            with torch.no_grad():
                 ref_logits_cache = sliding_forward(ref_policy, feats)[0]
 
         # ── 单次 forward：同时用于采样和梯度 ──
-        with fp16_autocast():
-            logits, exit_iters, route_lp, exp_depth = sliding_forward(
-                policy, feats, attn_mask, ffn_mask)
+        logits, exit_iters, route_lp, exp_depth = sliding_forward(
+            policy, feats, attn_mask, ffn_mask)
         log_probs = F.log_softmax(logits.float(), dim=-1)
 
         # 采样 actions（detached，不影响梯度）
@@ -334,7 +326,7 @@ def train_grpo(policy, ref_policy, train_feats, train_rets,
         tmp_path = ckpt_path + ".tmp"
         torch.save({
             "step": ep,
-            "model": {k.replace("_orig_mod.", ""): v for k, v in raw_model.state_dict().items()},
+            "model": raw_model.state_dict(),
             "muon_opt": muon_opt.state_dict(),
             "sgd_opt": sgd_opt.state_dict(),
             "scaler": scaler.state_dict(),
