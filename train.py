@@ -214,6 +214,12 @@ def train_grpo(policy, ref_policy, train_feats, train_rets,
 
         bh_sharpe, bh_return = compute_bh_metrics(rets)
 
+        # ── ref_policy forward 先算（no_grad，峰值低）──
+        ref_logits_cache = None
+        if BETA_KL > 0:
+            with torch.no_grad():
+                ref_logits_cache = sliding_forward(ref_policy, feats)[0]
+
         # ── 单次 forward：同时用于采样和梯度 ──
         logits, exit_iters, route_lp, exp_depth = sliding_forward(
             policy, feats, attn_mask, ffn_mask)
@@ -277,11 +283,9 @@ def train_grpo(policy, ref_policy, train_feats, train_rets,
             ortho_loss = torch.tensor(0.0, device=feats.device)
 
         kl = torch.tensor(0.0, device=feats.device)
-        if BETA_KL > 0:
-            with torch.no_grad():
-                ref_logits, _, _, _ = sliding_forward(ref_policy, feats)
-                ref_lp = F.log_softmax(ref_logits.float(), dim=-1)
-                ref_p  = ref_lp.exp()
+        if BETA_KL > 0 and ref_logits_cache is not None:
+            ref_lp = F.log_softmax(ref_logits_cache.float(), dim=-1)
+            ref_p  = ref_lp.exp()
             kl = (ref_p * (ref_lp - log_probs)).sum(dim=-1).mean()
 
         loss = loss_clip + loss_route_reinforce + BETA_KL * kl - ENTROPY_COEFF * entropy + ortho_loss + loss_depth
