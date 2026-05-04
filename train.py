@@ -307,13 +307,15 @@ def train_grpo(policy, ref_policy, train_feats, train_rets,
 
         return loss.item(), rw.mean().item(), rw.std().item()
 
-    # ── Signal handler for graceful shutdown (rank 0) ──
+    # ── Signal handler for graceful shutdown (all processes) ──
     _graceful = [False]
-    if is_main:
-        def _sig_handler(signum, frame):
-            _graceful[0] = True
-        signal.signal(signal.SIGINT, _sig_handler)
-        signal.signal(signal.SIGTERM, _sig_handler)
+    def _sig_handler(signum, frame):
+        _graceful[0] = True
+
+    signal.signal(signal.SIGINT, _sig_handler)
+    signal.signal(signal.SIGTERM, _sig_handler)
+    signal.siginterrupt(signal.SIGINT, True)
+    signal.siginterrupt(signal.SIGTERM, True)
 
     def _save_ckpt(ep):
         ckpt_path = os.path.join(OUTPUT_DIR, f"ckpt_{ep}.pt")
@@ -377,9 +379,8 @@ def train_grpo(policy, ref_policy, train_feats, train_rets,
             except Exception:
                 print(f"\n  Interrupted at step {last_ep}. Checkpoint save FAILED.")
         # 恢复默认信号处理器，避免后续 Ctrl+C 无反应
-        if is_main:
-            signal.signal(signal.SIGINT, signal.default_int_handler)
-            signal.signal(signal.SIGTERM, signal.SIG_DFL)
+        signal.signal(signal.SIGINT, signal.default_int_handler)
+        signal.signal(signal.SIGTERM, signal.SIG_DFL)
 
     if is_main:
         if interrupted:
