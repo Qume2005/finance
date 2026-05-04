@@ -269,7 +269,7 @@ class MoAKDALayer(nn.Module):
         # STE mask (unified)
         mask_k = (sel[hi] == ei.unsqueeze(1).unsqueeze(2))
         prob_k = probs[hi, :, :, ei]
-        eff = (prob_k + (mask_k.float() - prob_k).detach()).unsqueeze(-1)
+        eff = (prob_k + (mask_k.to(prob_k.dtype) - prob_k).detach()).unsqueeze(-1)
 
         # ── Q projection ──
         lA_q = self.lora_A_q[fi]; lB_q = self.lora_B_q[fi]
@@ -351,7 +351,7 @@ class MoAKDALayer(nn.Module):
         logits = torch.einsum('btd,hed->hbte', route_input, self.router_w)
         logits = logits.clamp(-10, 10)                      # (H, B, T, E)
 
-        probs = F.softmax(logits / ROUTE_TEMP, dim=-1)
+        probs = F.softmax(logits / ROUTE_TEMP, dim=-1).to(stream.dtype)
 
         if self.training:
             sel = torch.multinomial(probs.reshape(-1, E), 1).reshape(H, B, T)
@@ -547,7 +547,7 @@ class MoESwiGLU(nn.Module):
         # STE mask
         mask_k = (sel[f_hi] == ef_ei.unsqueeze(1).unsqueeze(2))
         prob_k = probs[f_hi, :, :, ef_ei]
-        eff = (prob_k + (mask_k.float() - prob_k).detach()).unsqueeze(-1)
+        eff = (prob_k + (mask_k.to(prob_k.dtype) - prob_k).detach()).unsqueeze(-1)
 
         # SwiGLU
         wd_out = torch.einsum('kbtd,kod->kbto', h_e, self.swiglu_wd_w[fi])
@@ -590,7 +590,7 @@ class MoESwiGLU(nn.Module):
 
         # ════════════════ 1. Routing (all heads, always with grad) ════════════════
         logits = torch.einsum('btd,fed->fbte', route_input, self.router_w).clamp(-10, 10)
-        probs = F.softmax(logits / ROUTE_TEMP, dim=-1)     # (nf, B, T, ne)
+        probs = F.softmax(logits / ROUTE_TEMP, dim=-1).to(stream.dtype)     # (nf, B, T, ne)
 
         if self.training:
             sel = torch.multinomial(probs.reshape(-1, ne), 1).reshape(nf, B, T)
@@ -837,16 +837,16 @@ class KDAPolicyNetwork(nn.Module):
         for i in range(self.max_iterations):
             # ── Halting decision ──
             logits = self.router(stream).clamp(-10, 10)           # (B, 2)
-            soft = F.softmax(logits / HALT_TEMP, dim=-1)          # (B, 2) [continue, exit]
+            soft = F.softmax(logits / HALT_TEMP, dim=-1).to(stream.dtype)  # (B, 2) [continue, exit]
 
             # Accumulate expected depth (for compute cost penalty)
             expected_depth = expected_depth + soft[:, 0]
 
             if self.training:
-                should_continue = (i < target_depths).float()
+                should_continue = (i < target_depths).to(stream.dtype)
                 gate = soft[:, 0] + (should_continue - soft[:, 0]).detach()
             else:
-                gate = (logits.argmax(dim=-1) == 0).float()
+                gate = (logits.argmax(dim=-1) == 0).to(stream.dtype)
 
             if i < self.min_iterations:
                 gate = torch.ones(B, device=stream.device)
