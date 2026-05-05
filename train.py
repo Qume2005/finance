@@ -318,8 +318,6 @@ def train_grpo(policy, ref_policy, train_feats, train_rets,
 
     signal.signal(signal.SIGINT, _sig_handler)
     signal.signal(signal.SIGTERM, _sig_handler)
-    signal.siginterrupt(signal.SIGINT, True)
-    signal.siginterrupt(signal.SIGTERM, True)
 
     def _save_ckpt(ep):
         ckpt_path = os.path.join(OUTPUT_DIR, f"ckpt_{ep}.pt")
