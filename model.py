@@ -6,8 +6,8 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils import checkpoint as cp
 
-from config import (D_HIDDEN, D_KEY, D_ATTN, N_ATTN_HEADS, N_EXPERTS_PER_HEAD,
-                    N_FFN_HEADS, N_EXPERTS_PER_FFN_HEAD,
+from config import (D_HIDDEN, D_KEY, D_ATTN_HEAD, N_ATTN_HEADS, N_EXPERTS_PER_HEAD,
+                    D_FFN_HEAD, N_FFN_HEADS, N_EXPERTS_PER_FFN_HEAD,
                     MAX_ITERATIONS, MIN_ITERATIONS, INNER_STEPS,
                     ROUTE_TEMP, HALT_TEMP,
                     GRADIENT_CHECKPOINTING, HEAD_DROP_PROB)
@@ -188,13 +188,12 @@ class MoAKDALayer(nn.Module):
     Per-head top-1 routing for Q and KV independently.
     Batched expert computation with active-pair filtering.
     """
-    def __init__(self, d_input, d_key=16, d_attn=48,
+    def __init__(self, d_input, d_key=16, d_head=48,
                  n_heads=8, n_experts_per_head=6,
                  n_mhc=4):
         super().__init__()
         self.dk = d_key
-        self.dv = d_attn // n_heads
-        assert d_attn % n_heads == 0, f"d_attn={d_attn} must be divisible by n_heads={n_heads}"
+        self.dv = d_head
         self.dk_pope = d_key * 2
         self.H = n_heads
         self.E = n_experts_per_head
@@ -458,8 +457,7 @@ class MoAKDALayer(nn.Module):
         out_he[zero_mask] = 0.0
 
         # ════════════════ 6. Output assembly ════════════════
-        out_he_scaled = out_he / math.sqrt(H * self.dv)
-        gated_he = out_he_scaled * acc_pre_gate            # (H, B, T, dv)
+        gated_he = out_he * acc_pre_gate                    # (H, B, T, dv)
         prob_h = probs.gather(-1, sel.unsqueeze(-1)).squeeze(-1)
         gated_he = gated_he * prob_h.unsqueeze(-1)         # × routing prob
         h_idx = torch.arange(H, device=stream.device).view(H, 1, 1)
@@ -467,7 +465,7 @@ class MoAKDALayer(nn.Module):
         W_o_token = self.W_o_w[flat_idx]                   # (H, B, T, d, dv)
         proj_he = _einsum('hbtv,hbtdv->hbtd', gated_he, W_o_token)
         result_he = proj_he * acc_post_gate                # (H, B, T, d)
-        result = result_he.sum(0)                          # (B, T, d)
+        result = result_he.mean(0)                          # (B, T, d)
 
         H_res_avg  = acc_H_res / H
         H_post_avg = acc_H_post / H
@@ -506,13 +504,14 @@ class MoESwiGLU(nn.Module):
     F heads, each with Ef experts (including zero expert 0).
     Per-head top-1 routing. Output: per-head preGate → per-expert W_o → per-head postGate.
     """
-    def __init__(self, d_hidden, n_heads=6, n_experts_per_head=8, n_mhc=4):
+    def __init__(self, d_hidden, n_heads=6, n_experts_per_head=8, n_mhc=4, d_head=None):
         super().__init__()
         self.nf = n_heads
         self.ne = n_experts_per_head
         FE = n_heads * n_experts_per_head
         self.FE = FE
         self.d = d_hidden
+        self.dh = d_head if d_head is not None else d_hidden
         self.n_mhc = n_mhc
 
         # Routing: per-head stacked router
@@ -528,11 +527,11 @@ class MoESwiGLU(nn.Module):
         self.swiglu_wu_w   = nn.Parameter(torch.randn(FE, d_hidden, d_hidden) * 0.01)
         self.swiglu_gate_w = nn.Parameter(torch.randn(FE, d_ffn, d_hidden) * 0.01)
         self.swiglu_up_w   = nn.Parameter(torch.randn(FE, d_ffn, d_hidden) * 0.01)
-        self.swiglu_down_w = nn.Parameter(torch.randn(FE, d_hidden, d_ffn) * 0.01)
+        self.swiglu_down_w = nn.Parameter(torch.randn(FE, self.dh, d_ffn) * 0.01)
 
-        # Output: per-head preGate → per-expert W_o → per-head postGate
-        self.W_pre_w = nn.Parameter(torch.randn(FE, d_hidden, d_hidden) * 0.01)
-        self.W_o_w   = nn.Parameter(torch.randn(FE, d_hidden, d_hidden) * 0.01)
+        # Output: per-head preGate(d_hidden→d_head) → per-expert W_o(d_head→d_hidden) → per-head postGate
+        self.W_pre_w = nn.Parameter(torch.randn(FE, self.dh, d_hidden) * 0.01)
+        self.W_o_w   = nn.Parameter(torch.randn(FE, d_hidden, self.dh) * 0.01)
         d_pg = max(int(d_hidden * 0.618), 1)
         self.W_pg1_w = nn.Parameter(torch.randn(FE, d_hidden, d_pg) * 0.01)
         self.W_pg2_w = nn.Parameter(torch.randn(FE, d_pg, d_hidden) * 0.01)
@@ -648,8 +647,9 @@ class MoESwiGLU(nn.Module):
         active_ef = active_idx % ne
 
         # ════════════════ 3. Accumulators ════════════════
-        out_buf = stream.new_zeros(nf, B, T, d)
-        acc_pre_gate = stream.new_zeros(nf, B, T, d)
+        dh = self.dh
+        out_buf = stream.new_zeros(nf, B, T, dh)
+        acc_pre_gate = stream.new_zeros(nf, B, T, dh)
         acc_post_gate = stream.new_zeros(nf, B, T, d)
         acc_H_res = stream.new_zeros(B, T, n, n)
         acc_H_post = stream.new_zeros(B, T, n)
@@ -698,7 +698,7 @@ class MoESwiGLU(nn.Module):
         W_o_token = self.W_o_w[flat_idx]                   # (nf, B, T, d, d)
         proj = _einsum('hbtd,hbted->hbte', gated, W_o_token)  # (nf, B, T, d)
         result_he = proj * acc_post_gate                   # (nf, B, T, d)
-        result = result_he.sum(0)                          # (B, T, d)
+        result = result_he.mean(0)                          # (B, T, d)
 
         # mHC
         H_res_avg = acc_H_res / nf
@@ -748,7 +748,8 @@ class KDAPolicyNetwork(nn.Module):
     Shared single MoA+MoE block looped dynamically.  Per-layer router
     decides continue/exit.  Training explores via pre-determined target depths.
     """
-    def __init__(self, d_input=14, d_hidden=D_HIDDEN, d_key=D_KEY, d_attn=D_ATTN,
+    def __init__(self, d_input=14, d_hidden=D_HIDDEN, d_key=D_KEY,
+                 d_attn_head=D_ATTN_HEAD, d_ffn_head=D_FFN_HEAD,
                  n_actions=11,
                  max_iterations=MAX_ITERATIONS, inner_steps=INNER_STEPS,
                  n_mhc=4, min_iterations=MIN_ITERATIONS,
@@ -768,12 +769,13 @@ class KDAPolicyNetwork(nn.Module):
             nn.Linear(d_input, d_hidden), nn.SiLU(), _RMSNorm(d_hidden))
 
         # MoA-KDA + MoE-SwiGLU
-        self.moa_kda = MoAKDALayer(d_hidden, d_key=d_key, d_attn=d_attn,
+        self.moa_kda = MoAKDALayer(d_hidden, d_key=d_key, d_head=d_attn_head,
                                     n_heads=n_heads,
                                     n_experts_per_head=n_experts_per_head,
                                     n_mhc=n_mhc)
         self.moe_swiglu = MoESwiGLU(d_hidden, n_heads=n_ffn_heads,
-                                     n_experts_per_head=n_experts_per_ffn_head, n_mhc=n_mhc)
+                                     n_experts_per_head=n_experts_per_ffn_head, n_mhc=n_mhc,
+                                     d_head=d_ffn_head)
 
         # Halting router
         self.router = HaltingRouter(d_hidden, n_mhc)
@@ -1043,3 +1045,18 @@ def migrate_checkpoint(state_dict):
                 new_sd.pop(f'moe_swiglu.experts.{i}.{suffix_old}', None)
 
     return new_sd
+
+
+if __name__ == "__main__":
+    model = KDAPolicyNetwork()
+    total = sum(p.numel() for p in model.parameters())
+    print(f"Total parameters: {total:,}")
+    for name, mod in [("MoA-KDA", model.moa_kda), ("MoE-SwiGLU", model.moe_swiglu),
+                      ("Router", model.router), ("AttnRes", None)]:
+        if mod is not None:
+            n = sum(p.numel() for p in mod.parameters())
+        else:
+            n = sum(p.numel() for n, p in model.named_parameters()
+                    if any(n.startswith(pfx) for pfx in ("preH_", "preH_iter", "preH_final",
+                                                          "w_final", "attn_res_expert")))
+        print(f"  {name}: {n:,} ({n/total*100:.1f}%)")
