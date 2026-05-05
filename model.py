@@ -523,14 +523,14 @@ class MoESwiGLU(nn.Module):
 
         # SwiGLU
         d_ffn = int(d_hidden * 1.618)
-        self.swiglu_wd_w   = nn.Parameter(torch.randn(FE, d_hidden, d_hidden) * 0.01)
-        self.swiglu_wu_w   = nn.Parameter(torch.randn(FE, d_hidden, d_hidden) * 0.01)
+        self.swiglu_wd_w   = nn.Parameter(torch.randn(FE, self.dh, d_hidden) * 0.01)
+        self.swiglu_wu_w   = nn.Parameter(torch.randn(FE, self.dh, self.dh) * 0.01)
         self.swiglu_gate_w = nn.Parameter(torch.randn(FE, d_ffn, d_hidden) * 0.01)
         self.swiglu_up_w   = nn.Parameter(torch.randn(FE, d_ffn, d_hidden) * 0.01)
         self.swiglu_down_w = nn.Parameter(torch.randn(FE, self.dh, d_ffn) * 0.01)
 
         # Output: per-head preGate(d_hidden→d_head) → per-expert W_o(d_head→d_hidden) → per-head postGate
-        self.W_pre_w = nn.Parameter(torch.randn(FE, self.dh, d_hidden) * 0.01)
+        self.W_pre_w = nn.Parameter(torch.randn(FE, d_hidden, self.dh) * 0.01)
         self.W_o_w   = nn.Parameter(torch.randn(FE, d_hidden, self.dh) * 0.01)
         d_pg = max(int(d_hidden * 0.618), 1)
         self.W_pg1_w = nn.Parameter(torch.randn(FE, d_hidden, d_pg) * 0.01)
