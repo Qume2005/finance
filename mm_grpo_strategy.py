@@ -74,11 +74,11 @@ def run_multi_gpu(n_gpus):
             self.feat_std = feat_std
             self.trainer.setup(data["train_feats"], data["train_rets"])
 
-        def compute_gradients(self, step):
-            return self.trainer.compute_gradients(step)
-
-        def get_gradients(self):
-            return self.trainer.get_gradients()
+        def compute_and_get_gradients(self, step):
+            """Forward + backward, return (metrics, gradients)."""
+            metrics = self.trainer.compute_gradients(step)
+            grads = self.trainer.get_gradients()
+            return metrics, grads
 
         def apply_gradients(self, avg_grads):
             self.trainer.apply_gradients(avg_grads)
@@ -139,20 +139,19 @@ def run_multi_gpu(n_gpus):
 
     try:
         for ep in range(start_ep, N_EPISODES + 1):
-            # 1. Forward + backward on all workers (parallel)
-            metrics = ray.get([w.compute_gradients.remote(ep) for w in workers])
+            # 1. Forward + backward + collect gradients (one round-trip)
+            results = ray.get([w.compute_and_get_gradients.remote(ep) for w in workers])
+            all_metrics, all_grads = zip(*results)
 
-            # 2. Collect gradients
-            all_grads = ray.get([w.get_gradients.remote() for w in workers])
+            # 2. Average gradients (driver-side)
+            avg_grads = average_gradients(list(all_grads), n_gpus)
 
-            # 3. Average gradients (driver-side)
-            avg_grads = average_gradients(all_grads, n_gpus)
+            # 3. Put once in object store → all workers share same memory
+            avg_ref = ray.put(avg_grads)
+            ray.get([w.apply_gradients.remote(avg_ref) for w in workers])
 
-            # 4. Apply averaged gradients (parallel)
-            ray.get([w.apply_gradients.remote(avg_grads) for w in workers])
-
-            # 5. Rank 0: report + checkpoint
-            m = metrics[0]
+            # 4. Rank 0: report + checkpoint
+            m = all_metrics[0]
             history["loss"].append(m["loss"])
             history["reward_mean"].append(m["reward_mean"])
             history["reward_std"].append(m["reward_std"])
