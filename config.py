@@ -42,7 +42,7 @@ OUTPUT_DIR = "output"
 
 # Dynamic loop
 
-MAX_ITERATIONS = 32
+MAX_ITERATIONS = 16
 MIN_ITERATIONS = 1
 ITER_REWARD_START = 2.0     # min_iterations 时的奖励系数
 ITER_REWARD_END   = 1.0     # max_iterations 时的奖励系数
