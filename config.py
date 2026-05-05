@@ -30,7 +30,7 @@ EPS_CLIP    = 0.2
 BETA_KL     = 0.01
 ENTROPY_COEFF = 0.01
 N_EPISODES  = 10000
-INNER_STEPS = 24             # 模型内循环固定步数（每个 halting 点内的 MoA+MoE 重复次数）
+INNER_STEPS = 32             # 模型内循环固定步数（每个 halting 点内的 MoA+MoE 重复次数）
 SAVE_EVERY  = 500
 LR          = 1e-3
 WEIGHT_DECAY = 0.01
@@ -42,7 +42,7 @@ OUTPUT_DIR = "output"
 
 # Dynamic loop
 
-MAX_ITERATIONS = 24
+MAX_ITERATIONS = 32
 MIN_ITERATIONS = 1
 ITER_REWARD_START = 2.0     # min_iterations 时的奖励系数
 ITER_REWARD_END   = 1.0     # max_iterations 时的奖励系数
