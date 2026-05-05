@@ -15,6 +15,7 @@ lightgbm>=4.1
 
 # Deep learning
 torch>=2.2
+ray>=2.40
 
 # Financial data
 yfinance>=0.2

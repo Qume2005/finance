@@ -4,17 +4,14 @@ MMn Differential Features + Mini-KDA + GRPO Position Control
 =============================================================
 Usage:
   Single GPU:  python mm_grpo_strategy.py
-  Multi-GPU:   torchrun --nproc_per_node=N mm_grpo_strategy.py
+  Multi-GPU:   python mm_grpo_strategy.py          (auto-detect GPUs, uses Ray)
 """
 
 import os
-import datetime
+import time
 import warnings
 
-os.environ.setdefault("TORCH_NCCL_ASYNC_ERROR_HANDLING", "1")
 import torch
-import torch.distributed as dist
-from torch.nn.parallel import DistributedDataParallel as DDP
 import matplotlib
 matplotlib.use("Agg")
 
@@ -22,120 +19,181 @@ warnings.filterwarnings("ignore")
 
 import numpy as np
 
-from config import (SEED, OUTPUT_DIR)
+from config import (SEED, OUTPUT_DIR, N_EPISODES, SAVE_EVERY)
 from data import prepare_datasets, prepare_test_data
-from model import KDAPolicyNetwork
-from train import train_grpo
+from train import (GRPOTrainer, average_gradients, _ACTION_HEAD_SUFFIXES)
 from evaluate import (
     plot_prices, plot_training_curves, run_backtest, plot_results,
     export_results, save_model, print_conclusions,
 )
 
 
-# ────────────────── DDP Utilities ──────────────────────────────
-def setup_distributed():
-    """Initialize DDP. Returns (rank, world_size, local_rank, device)."""
-    if "RANK" in os.environ and "WORLD_SIZE" in os.environ:
-        local_rank = int(os.environ["LOCAL_RANK"])
-        torch.cuda.set_device(local_rank)
-        device = torch.device(f"cuda:{local_rank}")
-        dist.init_process_group("nccl", device_id=device,
-                                timeout=datetime.timedelta(hours=1))
-        rank       = dist.get_rank()
-        world_size = dist.get_world_size()
-    else:
-        rank, world_size, local_rank = 0, 1, 0
-        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+# ────────────────── Single GPU ──────────────────────────────────
 
-    return rank, world_size, local_rank, device
+def run_single_gpu():
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print(f"Device: {device}  |  Single GPU")
+
+    data = prepare_datasets(device, seed=SEED)
+    print(f"Train: {sum(f.shape[0] for f in data['train_feats'])} samples")
+
+    from train import train_single
+    history, model = train_single(data["train_feats"], data["train_rets"], device)
+
+    plot_training_curves(history, output_dir=OUTPUT_DIR)
+
+    # Evaluate
+    model.eval()
+    save_model(model, os.path.join(OUTPUT_DIR, "policy.pt"))
+    test_data = prepare_test_data(device, data["feat_mean"], data["feat_std"])
+    plot_prices(test_data["prices_list"], output_dir=OUTPUT_DIR)
+    results = run_backtest(model, test_data["test_feats"], test_data["test_rets"])
+    plot_results(results, output_dir=OUTPUT_DIR)
+    export_results(results, history)
+    print_conclusions()
 
 
-def cleanup_distributed():
-    if dist.is_initialized():
-        dist.destroy_process_group()
+# ────────────────── Multi GPU (Ray) ─────────────────────────────
 
+def run_multi_gpu(n_gpus):
+    import ray
 
-def create_models(device, is_main, world_size, local_rank):
-    """Create policy + ref model (uncompiled), wrap with DDP if multi-GPU.
-    Compilation is deferred to train_grpo() after checkpoint loading."""
-    torch.manual_seed(SEED)
-    raw_policy = KDAPolicyNetwork().to(device)
-    torch.manual_seed(SEED)
-    ref_policy = KDAPolicyNetwork().to(device)
-    ref_policy.load_state_dict(raw_policy.state_dict())
-    ref_policy.eval()
-    for p in ref_policy.parameters():
-        p.requires_grad = False
+    ray.init(num_gpus=n_gpus)
 
-    policy = raw_policy
+    @ray.remote(num_gpus=1)
+    class TrainingWorker:
+        def __init__(self, rank, world_size):
+            gpu_ids = ray.get_gpu_ids()
+            self.device = torch.device(f"cuda:{gpu_ids[0]}")
+            self.trainer = GRPOTrainer(self.device, rank, world_size)
 
-    if is_main:
-        n_params = sum(p.numel() for p in raw_policy.parameters())
-        print(f"Parameters: {n_params:,}")
+        def setup(self, seed, feat_mean, feat_std):
+            """Create data and model on this worker."""
+            data = prepare_datasets(self.device, seed=seed)
+            self.feat_mean = feat_mean
+            self.feat_std = feat_std
+            self.trainer.setup(data["train_feats"], data["train_rets"])
 
-    # DDP: wrap before compile
-    if world_size > 1:
-        policy = DDP(policy, device_ids=[local_rank], find_unused_parameters=True)
+        def compute_gradients(self, step):
+            return self.trainer.compute_gradients(step)
 
-    if is_main:
-        print("Model ready (DDP).")
+        def get_gradients(self):
+            return self.trainer.get_gradients()
 
-    return policy, ref_policy, raw_policy
+        def apply_gradients(self, avg_grads):
+            self.trainer.apply_gradients(avg_grads)
+
+        def save_checkpoint(self, step, history):
+            return self.trainer.save_checkpoint(step, history)
+
+        def get_history(self):
+            return self.trainer.get_history()
+
+        def get_start_ep(self):
+            return self.trainer.get_start_ep()
+
+    print(f"Ray initialized with {n_gpus} GPUs")
+
+    # Create workers
+    workers = [TrainingWorker.remote(i, n_gpus) for i in range(n_gpus)]
+
+    # Setup: each worker gets different seed for data diversity
+    seed_rng = np.random.RandomState(SEED)
+    rank_seeds = [seed_rng.randint(0, 2**31) for _ in range(n_gpus)]
+
+    # Need feat_mean/feat_std from one worker for later evaluation
+    # Use rank 0's normalization stats
+    ray.get([w.setup.remote(rank_seeds[i], None, None) for i, w in enumerate(workers)])
+
+    start_ep = ray.get(workers[0].get_start_ep.remote())
+    os.makedirs(OUTPUT_DIR, exist_ok=True)
+    print(f"\nTraining {N_EPISODES} steps × {n_gpus} GPUs  "
+          f"(start from step {start_ep})")
+
+    print(f"""
+                _ooOoo_
+               o8888888o
+               88" . "88
+               (| -_- |)
+               O\\  =  /O
+            ____/`---'\\____
+          .'  \\\\|     |//  `.
+         /  \\\\|||  :  |||//  \\
+        /  _||||| -:- |||||-  \\
+        |   | \\\\\\  -  /// |   |
+        | \\_|  ''\\---/''  |   |
+        \\  .-\\__  `-`  ___/-. /
+      ___`. .'  /--.--\\  `. . __
+   ."" '<  `.___\\_<|>_/___.'  >'"".
+  | | :  `- \\`.;`\\ _ /`;.`/ - ` : | |
+  \\  \\ `-.   \\_ __\\ /__ _/   .-` /  /
+ ======`-.____`-.___\\_____/___.-`____.-'======
+                    `=---='
+ ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+         佛祖保佑     不掉驱动
+""")
+
+    history = ray.get(workers[0].get_history.remote())
+    t0 = time.time()
+    last_ep = start_ep - 1
+
+    try:
+        for ep in range(start_ep, N_EPISODES + 1):
+            # 1. Forward + backward on all workers (parallel)
+            metrics = ray.get([w.compute_gradients.remote(ep) for w in workers])
+
+            # 2. Collect gradients
+            all_grads = ray.get([w.get_gradients.remote() for w in workers])
+
+            # 3. Average gradients (driver-side)
+            avg_grads = average_gradients(all_grads, n_gpus)
+
+            # 4. Apply averaged gradients (parallel)
+            ray.get([w.apply_gradients.remote(avg_grads) for w in workers])
+
+            # 5. Rank 0: report + checkpoint
+            m = metrics[0]
+            history["loss"].append(m["loss"])
+            history["reward_mean"].append(m["reward_mean"])
+            history["reward_std"].append(m["reward_std"])
+            last_ep = ep
+
+            if ep % 50 == 0 or ep == 1:
+                elapsed = time.time() - t0
+                print(f"  Step {ep:4d}/{N_EPISODES}  loss={m['loss']:+.4f}  "
+                      f"reward={m['reward_mean']:+.4f}±{m['reward_std']:.4f}  "
+                      f"[{elapsed:.0f}s]")
+
+            if SAVE_EVERY and ep % SAVE_EVERY == 0:
+                ckpt = ray.get(workers[0].save_checkpoint.remote(ep, history))
+                print(f"  Checkpoint saved → {ckpt}")
+            elif n_gpus > 1:
+                ray.get(workers[0].save_checkpoint.remote(ep, history))
+
+    except KeyboardInterrupt:
+        print(f"\n  Interrupted at step {last_ep}.")
+    finally:
+        if last_ep >= start_ep:
+            try:
+                ckpt = ray.get(workers[0].save_checkpoint.remote(last_ep, history))
+                print(f"  Final checkpoint saved → {ckpt}")
+            except Exception:
+                print(f"  Checkpoint save FAILED at step {last_ep}.")
+
+    print(f"Training {'interrupted' if last_ep < N_EPISODES else 'done'} "
+          f"at step {last_ep} ({time.time()-t0:.1f}s)")
+    ray.shutdown()
 
 
 # ────────────────── Main ───────────────────────────────────────
+
 def main():
-    rank, world_size, local_rank, device = setup_distributed()
-    is_main = (rank == 0)
+    n_gpus = torch.cuda.device_count()
 
-    if is_main:
-        print(f"Device: {device}  |  World size: {world_size}")
-        os.makedirs(OUTPUT_DIR, exist_ok=True)
-
-    # ──── Step 1: Train data only (all ranks) ────
-    seed_rng = np.random.RandomState(SEED)
-    rank_seeds = [seed_rng.randint(0, 2**31) for _ in range(world_size)]
-    data = prepare_datasets(device, seed=rank_seeds[rank])
-
-    if is_main:
-        print(f"Train: {sum(f.shape[0] for f in data['train_feats'])} samples")
-
-    # all ranks must wait for rank 0 to finish plotting before entering DDP
-    if world_size > 1:
-        dist.barrier()
-
-    # ──── Step 2: Model ────
-    policy, ref_policy, raw_policy = create_models(device, is_main, world_size, local_rank)
-
-    # ──── Step 3: Train ────
-    history = train_grpo(policy, ref_policy,
-                         data["train_feats"], data["train_rets"],
-                         rank, world_size, is_main,
-                         raw_model=raw_policy)
-    if is_main:
-        plot_training_curves(history, output_dir=OUTPUT_DIR)
-
-    # 多卡：训练结束直接退出（评估用单卡单独跑）
-    if world_size > 1:
-        if not is_main:
-            os._exit(0)
-        else:
-            cleanup_distributed()
-            return
-
-    # ──── Step 4: Test data + Evaluate (单卡) ────
-    raw_policy.eval()
-    save_model(raw_policy, os.path.join(OUTPUT_DIR, "policy.pt"))
-
-    test_data = prepare_test_data(device, data["feat_mean"], data["feat_std"])
-    plot_prices(test_data["prices_list"], output_dir=OUTPUT_DIR)
-
-    results = run_backtest(raw_policy, test_data["test_feats"], test_data["test_rets"])
-    plot_results(results, output_dir=OUTPUT_DIR)
-
-    export_results(results, history)
-
-    print_conclusions()
+    if n_gpus <= 1:
+        run_single_gpu()
+    else:
+        run_multi_gpu(n_gpus)
 
 
 if __name__ == "__main__":
