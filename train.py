@@ -20,7 +20,7 @@ from config import (SEED, EPISODE_LEN, G_SAMPLES, LAMBDA_REWARD, REWARD_SCALE,
                     N_ATTN_HEADS_PER_CARD, N_FFN_HEADS_PER_CARD,
                     HEAD_ROTATION_INTERVAL)
 from muon import NewtonMuon
-from torch.cuda.amp import GradScaler
+from torch.amp import GradScaler
 
 
 # ────────────────── Head-wise expert parallelism ──────────────────
@@ -159,7 +159,7 @@ class GRPOTrainer:
             torch.optim.lr_scheduler.CosineAnnealingLR(opt, N_EPISODES)
             for opt in self.optimizers
         ]
-        self.scaler = GradScaler()
+        self.scaler = GradScaler("cuda")
 
         self.start_ep = 1
         self.history = {"loss": [], "reward_mean": [], "reward_std": []}
