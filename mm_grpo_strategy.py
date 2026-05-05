@@ -63,8 +63,8 @@ def run_multi_gpu(n_gpus):
     @ray.remote(num_gpus=1)
     class TrainingWorker:
         def __init__(self, rank, world_size):
-            gpu_ids = ray.get_gpu_ids()
-            self.device = torch.device(f"cuda:{gpu_ids[0]}")
+            # Ray sets CUDA_VISIBLE_DEVICES to expose only the assigned GPU as cuda:0
+            self.device = torch.device("cuda")
             self.trainer = GRPOTrainer(self.device, rank, world_size)
 
         def setup(self, seed, feat_mean, feat_std):
