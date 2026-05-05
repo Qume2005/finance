@@ -234,6 +234,10 @@ class GRPOTrainer:
 
         # Head-wise expert parallelism masks
         attn_mask, ffn_mask = compute_head_masks(step, self.world_size, self.rank)
+        if attn_mask is not None:
+            attn_mask = attn_mask.to(self.device)
+        if ffn_mask is not None:
+            ffn_mask = ffn_mask.to(self.device)
 
         bh_sharpe, bh_return = compute_bh_metrics(rets)
 
