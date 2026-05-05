@@ -8,6 +8,7 @@ Usage:
 """
 
 import os
+import socket
 import time
 import warnings
 
@@ -21,11 +22,17 @@ import numpy as np
 
 from config import (SEED, OUTPUT_DIR, N_EPISODES, SAVE_EVERY)
 from data import prepare_datasets, prepare_test_data
-from train import (GRPOTrainer, average_gradients, _ACTION_HEAD_SUFFIXES)
+from train import GRPOTrainer
 from evaluate import (
     plot_prices, plot_training_curves, run_backtest, plot_results,
     export_results, save_model, print_conclusions,
 )
+
+
+def _free_port():
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        s.bind(("", 0))
+        return s.getsockname()[1]
 
 
 # ────────────────── Single GPU ──────────────────────────────────
@@ -53,7 +60,7 @@ def run_single_gpu():
     print_conclusions()
 
 
-# ────────────────── Multi GPU (Ray) ─────────────────────────────
+# ────────────────── Multi GPU (Ray + NCCL) ──────────────────────
 
 def run_multi_gpu(n_gpus):
     import ray
@@ -63,25 +70,18 @@ def run_multi_gpu(n_gpus):
     @ray.remote(num_gpus=1)
     class TrainingWorker:
         def __init__(self, rank, world_size):
-            # Ray sets CUDA_VISIBLE_DEVICES to expose only the assigned GPU as cuda:0
             self.device = torch.device("cuda")
             self.trainer = GRPOTrainer(self.device, rank, world_size)
 
-        def setup(self, seed, feat_mean, feat_std):
-            """Create data and model on this worker."""
+        def setup(self, seed):
             data = prepare_datasets(self.device, seed=seed)
-            self.feat_mean = feat_mean
-            self.feat_std = feat_std
             self.trainer.setup(data["train_feats"], data["train_rets"])
 
-        def compute_and_get_gradients(self, step):
-            """Forward + backward, return (metrics, gradients)."""
-            metrics = self.trainer.compute_gradients(step)
-            grads = self.trainer.get_gradients()
-            return metrics, grads
+        def init_nccl(self, master_addr, port):
+            self.trainer.init_nccl(master_addr, port)
 
-        def apply_gradients(self, avg_grads):
-            self.trainer.apply_gradients(avg_grads)
+        def step(self, ep):
+            return self.trainer.step_synced(ep)
 
         def save_checkpoint(self, step, history):
             return self.trainer.save_checkpoint(step, history)
@@ -100,10 +100,12 @@ def run_multi_gpu(n_gpus):
     # Setup: each worker gets different seed for data diversity
     seed_rng = np.random.RandomState(SEED)
     rank_seeds = [seed_rng.randint(0, 2**31) for _ in range(n_gpus)]
+    ray.get([w.setup.remote(rank_seeds[i]) for i, w in enumerate(workers)])
 
-    # Need feat_mean/feat_std from one worker for later evaluation
-    # Use rank 0's normalization stats
-    ray.get([w.setup.remote(rank_seeds[i], None, None) for i, w in enumerate(workers)])
+    # Init NCCL process group across all workers
+    port = _free_port()
+    addr = ray.util.get_node_ip_address()
+    ray.get([w.init_nccl.remote(addr, port) for w in workers])
 
     start_ep = ray.get(workers[0].get_start_ep.remote())
     os.makedirs(OUTPUT_DIR, exist_ok=True)
@@ -139,19 +141,10 @@ def run_multi_gpu(n_gpus):
 
     try:
         for ep in range(start_ep, N_EPISODES + 1):
-            # 1. Forward + backward + collect gradients (one round-trip)
-            results = ray.get([w.compute_and_get_gradients.remote(ep) for w in workers])
-            all_metrics, all_grads = zip(*results)
+            # Single round-trip: workers sync gradients via NCCL internally
+            metrics = ray.get([w.step.remote(ep) for w in workers])
 
-            # 2. Average gradients (driver-side)
-            avg_grads = average_gradients(list(all_grads), n_gpus)
-
-            # 3. Put once in object store → all workers share same memory
-            avg_ref = ray.put(avg_grads)
-            ray.get([w.apply_gradients.remote(avg_ref) for w in workers])
-
-            # 4. Rank 0: report + checkpoint
-            m = all_metrics[0]
+            m = metrics[0]
             history["loss"].append(m["loss"])
             history["reward_mean"].append(m["reward_mean"])
             history["reward_std"].append(m["reward_std"])
@@ -166,7 +159,7 @@ def run_multi_gpu(n_gpus):
             if SAVE_EVERY and ep % SAVE_EVERY == 0:
                 ckpt = ray.get(workers[0].save_checkpoint.remote(ep, history))
                 print(f"  Checkpoint saved → {ckpt}")
-            elif n_gpus > 1:
+            else:
                 ray.get(workers[0].save_checkpoint.remote(ep, history))
 
     except KeyboardInterrupt:

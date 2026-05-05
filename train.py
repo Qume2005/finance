@@ -87,20 +87,6 @@ def compute_rewards(positions, daily_returns, bh_sharpe, bh_return):
 
 # ────────────────── Gradient averaging (driver-side) ──────────────────
 
-def average_gradients(all_grads, world_size):
-    """
-    Expert/MoA/MoE 参数：只有 1 个 GPU 有梯度 → sum = 正确梯度
-    Output head 参数：所有 GPU 都有梯度 → mean = 正确梯度
-    """
-    avg = {}
-    for name in all_grads[0]:
-        tensors = [g[name] for g in all_grads if name in g]
-        if any(name.endswith(s) for s in _ACTION_HEAD_SUFFIXES):
-            avg[name] = sum(tensors) / world_size
-        else:
-            avg[name] = sum(tensors)
-    return avg
-
 
 # ────────────────── GRPOTrainer ──────────────────
 
@@ -217,8 +203,8 @@ class GRPOTrainer:
         exp_depth_avg = expected_depth.reshape(B, n_w).float().mean(dim=-1)
         return result, exit_avg, route_lp_avg, exp_depth_avg
 
-    def compute_gradients(self, step):
-        """Forward + backward, NO optimizer step. Returns metrics dict."""
+    def _forward_backward(self, step):
+        """Forward + backward + unscale. Returns metrics dict. No optimizer step."""
         feats, rets = self.prefetcher.get()
 
         # NewtonMuon preconditioner refresh
@@ -323,10 +309,47 @@ class GRPOTrainer:
         for opt in self.optimizers:
             self.scaler.unscale_(opt)
 
-        # NOTE: no gradient scaling here — handled by driver-side average_gradients()
-
         return {"loss": loss.item(), "reward_mean": rw.mean().item(),
                 "reward_std": rw.std().item()}
+
+    def compute_gradients(self, step):
+        """Single-GPU: forward + backward. Returns metrics dict."""
+        return self._forward_backward(step)
+
+    def init_nccl(self, master_addr, port):
+        """初始化 NCCL 进程组（Ray 多卡模式）。"""
+        import torch.distributed as dist
+        os.environ["MASTER_ADDR"] = master_addr
+        os.environ["MASTER_PORT"] = str(port)
+        dist.init_process_group("nccl", rank=self.rank, world_size=self.world_size)
+        self._nccl = True
+
+    def step_synced(self, step):
+        """多卡完整一步：forward + backward + NCCL allreduce + clip + step + broadcast。"""
+        import torch.distributed as dist
+
+        metrics = self._forward_backward(step)
+
+        # NCCL allreduce on GPU
+        for name, param in self.model.named_parameters():
+            if param.grad is None:
+                param.grad = torch.zeros_like(param)
+            dist.all_reduce(param.grad, op=dist.ReduceOp.SUM)
+            if any(name.endswith(s) for s in _ACTION_HEAD_SUFFIXES):
+                param.grad /= self.world_size
+
+        nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
+        for opt in self.optimizers:
+            self.scaler.step(opt)
+        self.scaler.update()
+        for sch in self.schedulers:
+            sch.step()
+
+        # 广播 rank 0 的模型权重，防止浮点漂移
+        for param in self.model.parameters():
+            dist.broadcast(param.data, src=0)
+
+        return metrics
 
     def get_gradients(self):
         """Return {name: cpu_tensor} for all params with gradients."""
