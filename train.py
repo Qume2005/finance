@@ -232,11 +232,10 @@ class GRPOTrainer:
 
     def _sliding_forward(self, model, feats, attn_head_mask=None, ffn_head_mask=None):
         B, T, D = feats.shape
-        n_w = (T + EPISODE_LEN - 1) // EPISODE_LEN
-        pad = n_w * EPISODE_LEN - T
-        if pad:
-            feats = torch.cat([feats, feats.new_zeros(B, pad, D)], dim=1)
-        windows = feats.reshape(B * n_w, EPISODE_LEN, D)
+        n_w = T - EPISODE_LEN + 1                            # stride=1 窗口数
+        windows = feats.unfold(1, EPISODE_LEN, 1)         # (B, n_w, D, EPISODE_LEN)
+        windows = windows.transpose(2, 3)                  # (B, n_w, EPISODE_LEN, D)
+        windows = windows.reshape(B * n_w, EPISODE_LEN, D)
         logits, exit_iters, route_lp, expected_depth = model(
             windows, attn_head_mask=attn_head_mask, ffn_head_mask=ffn_head_mask)
         result = logits.reshape(B, n_w, -1)
@@ -287,12 +286,10 @@ class GRPOTrainer:
             old_action_lp = log_probs.unsqueeze(0).expand(G_SAMPLES, -1, -1, -1) \
                                 .gather(3, actions.unsqueeze(3)).squeeze(3).detach()
 
-        # shift + reward
+        # stride=1: 每个 action 对应一天，前 EPISODE_LEN 天默认持仓
         default = torch.full((G_SAMPLES, feats.shape[0], EPISODE_LEN), 5,
                              dtype=actions.dtype, device=actions.device)
-        shifted = actions[:, :, :-1].unsqueeze(-1).expand(-1, -1, -1, EPISODE_LEN) \
-                      .reshape(G_SAMPLES, feats.shape[0], -1)
-        actions_tiled = torch.cat([default, shifted], dim=-1)[:, :, :T_real]
+        actions_tiled = torch.cat([default, actions], dim=-1)[:, :, :T_real]
         rw = compute_rewards(actions_tiled, rets, bh_sharpe, bh_return)
         adv = rw.detach()
 

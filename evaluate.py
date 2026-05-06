@@ -30,39 +30,27 @@ def print_backtest_result(result, label=""):
 
 
 def backtest_series(policy, feats, rets, label="", quiet=False):
-    """Run backtest with parallel sliding window (same as train)."""
+    """Run backtest with stride-1 sliding window."""
     device = next(policy.parameters()).device
     feats = feats.to(device)
     rets = rets.to(device)
     T = feats.shape[0] - 1                               # 可决策的时间步
     D = feats.shape[1]
+    n_w = T - EPISODE_LEN + 1                            # stride=1 窗口数
     with torch.no_grad():
         f = feats[:T]                                    # (T, D)
-        n_w = (T + EPISODE_LEN - 1) // EPISODE_LEN
-        pad = n_w * EPISODE_LEN - T
-        if pad:
-            f = torch.cat([f, f.new_zeros(pad, D)], dim=0)
+        windows = f.unfold(0, EPISODE_LEN, 1)            # (n_w, D, EPISODE_LEN)
+        windows = windows.transpose(1, 2)                # (n_w, EPISODE_LEN, D)
+        logits, exit_iters_w, _, _ = policy(windows)      # (n_w, n_actions), (n_w,)
 
-        # 逐窗口 forward（避免大 batch 打爆显存）
-        windows = f.reshape(n_w, EPISODE_LEN, D)         # (n_w, EPISODE_LEN, D)
-        all_logits, all_exit = [], []
-        for w in windows:
-            logits_w, exit_w, _, _ = policy(w.unsqueeze(0))
-            all_logits.append(logits_w.squeeze(0))
-            all_exit.append(exit_w.squeeze(0))
-        logits = torch.stack(all_logits)                  # (n_w, n_actions)
-        exit_iters_w = torch.stack(all_exit)              # (n_w,)
-
-        # Shift: window i's action → timesteps [(i+1)*EPISODE_LEN : (i+2)*EPISODE_LEN]
-        # First EPISODE_LEN timesteps: neutral position 5
-        actions = logits.argmax(dim=-1)                    # (n_w,)
+        # stride=1: 每个 action 对应一天，前 EPISODE_LEN 天默认持仓 5
+        actions = logits.argmax(dim=-1)                   # (n_w,)
         default = torch.full((EPISODE_LEN,), 5, dtype=actions.dtype, device=actions.device)
-        shifted = actions[:-1].unsqueeze(-1).expand(-1, EPISODE_LEN).reshape(-1)
-        positions = torch.cat([default, shifted])[:T]
+        positions = torch.cat([default, actions])[:T]
 
-        # per-window depth → per-token
-        exit_iters = exit_iters_w.cpu().numpy()
-        exit_iters = np.repeat(exit_iters, EPISODE_LEN)[:T]
+        # per-window depth → per-token（前 EPISODE_LEN 天无值）
+        exit_np = exit_iters_w.cpu().numpy()
+        exit_iters = np.concatenate([np.full(EPISODE_LEN, np.nan), exit_np])[:T]
 
     rets_f = rets[:T]                                     # action shift 已保证无 look-ahead
     pos_w = positions.float() / 10.0

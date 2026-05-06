@@ -16,33 +16,21 @@ from config import (D_HIDDEN, D_KEY, D_ATTN_HEAD, N_ATTN_HEADS, N_EXPERTS_PER_HE
 # ────────────────── Utilities ──────────────────
 
 class _RMSNorm(nn.Module):
-    """RMSNorm that preserves input dtype (handles fp16 correctly)."""
     def __init__(self, d, eps=1e-8):
         super().__init__()
         self.eps = eps
         self.weight = nn.Parameter(torch.ones(d))
 
     def forward(self, x):
-        return x * torch.rsqrt(x.float().pow(2).mean(-1, keepdim=True).add(self.eps)).to(x.dtype) * self.weight
+        return x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True).add(self.eps)) * self.weight
 
 
-def _einsum(eq, *operands):
-    """Einsum with fp16 matmul (V100 Tensor Core), fp32 result."""
-    ops = [op.half() if op.is_floating_point() else op for op in operands]
-    return torch.einsum(eq, *ops).float()
-
-
-def _bmm(a, b):
-    """Batched matmul with fp16 (V100 Tensor Core), fp32 result."""
-    return torch.bmm(a.half(), b.half()).float()
-
-
-def sinkhorn_knopp(M, n_iters=6):
+def sinkhorn_knopp(M, n_iters=4):
     """Project (..., n, n) to doubly stochastic matrix."""
-    M = torch.exp(M)
+    M = torch.exp(M - M.amax(dim=(-1, -2), keepdim=True))
     for _ in range(n_iters):
-        M = M / M.sum(dim=-1, keepdim=True)
-        M = M / M.sum(dim=-2, keepdim=True)
+        M.div_(M.sum(dim=-1, keepdim=True))
+        M.div_(M.sum(dim=-2, keepdim=True))
     return M
 
 
@@ -139,22 +127,22 @@ class BatchedMHC(nn.Module):
         nw = self.norm_w[active_idx]            # (K, nd)
 
         # Batched RMSNorm
-        rms = x.float().pow(2).mean(-1, keepdim=True).add(1e-8).rsqrt().to(x.dtype)
+        rms = x.pow(2).mean(-1, keepdim=True).add(1e-8).rsqrt()
         x = x * rms * nw.unsqueeze(1).unsqueeze(1)
 
         # phi_pre: (K, B, T, nd) @ (K, n, nd) → (K, B, T, n)
         H_pre = torch.sigmoid(
             self.alpha_pre[active_idx].view(K, 1, 1, 1)
-            * _einsum('kbtd,knd->kbtn', x, self.phi_pre_w[active_idx])
+            * torch.einsum('kbtd,knd->kbtn', x, self.phi_pre_w[active_idx])
             + self.b_pre[active_idx].unsqueeze(1).unsqueeze(1))
 
         H_post = 2 * torch.sigmoid(
             self.alpha_post[active_idx].view(K, 1, 1, 1)
-            * _einsum('kbtd,knd->kbtn', x, self.phi_post_w[active_idx])
+            * torch.einsum('kbtd,knd->kbtn', x, self.phi_post_w[active_idx])
             + self.b_post[active_idx].unsqueeze(1).unsqueeze(1))
 
-        res_einsum = _einsum('kbtd,knd->kbtn', x, self.phi_res_w[active_idx])
-        res_flat = res_einsum.reshape(K, B, T, n, n)
+        res_einsum = torch.einsum('kbtd,knd->kbtn', x, self.phi_res_w[active_idx])
+        res_flat = res_einsum.view(K, B, T, n, n)
         H_res_raw = (
             self.alpha_res[active_idx].view(K, 1, 1, 1, 1)
             * res_flat
@@ -170,12 +158,12 @@ class BatchedMHC(nn.Module):
 def _kda_step(q_t, k_t, v_t, alpha_t, beta_t, S):
     """Single KDA recursion step — compiled as a small graph."""
     aS = alpha_t.unsqueeze(-1) * S
-    kt_aS = _einsum('bd,bde->be', k_t, aS)
+    kt_aS = torch.bmm(k_t.unsqueeze(1), aS).squeeze(1)
     bt = beta_t.unsqueeze(-1)
     S = (aS
-         - bt * _bmm(k_t.unsqueeze(2), kt_aS.unsqueeze(1))
-         + bt * _bmm(k_t.unsqueeze(2), v_t.unsqueeze(1)))
-    out_t = _einsum('bd,bde->be', q_t, S)
+         - bt * torch.bmm(k_t.unsqueeze(2), kt_aS.unsqueeze(1))
+         + bt * torch.bmm(k_t.unsqueeze(2), v_t.unsqueeze(1)))
+    out_t = torch.bmm(q_t.unsqueeze(1), S).squeeze(1)
     return out_t, S
 
 
@@ -234,12 +222,9 @@ class MoAKDALayer(nn.Module):
         self.batched_mhc = BatchedMHC(n_heads, d_input, n_mhc)
         self.batched_norm_w = nn.Parameter(torch.ones(n_heads, d_input))
 
-        # ── Per-head preGate/postGate + per-expert W_o ──
+        # ── Per-head preGate + per-expert W_o ──
         self.W_pre_w = nn.Parameter(torch.randn(n_heads, d_input, self.dv) * 0.01)
         self.W_o_w   = nn.Parameter(torch.randn(HE, d_input, self.dv) * 0.01)
-        d_pg = max(int(d_input * 0.618), 1)
-        self.W_pg1_w = nn.Parameter(torch.randn(n_heads, d_input, d_pg) * 0.01)
-        self.W_pg2_w = nn.Parameter(torch.randn(n_heads, d_pg, d_input) * 0.01)
 
     def _apply_pope(self, x, positions, is_query):
         mu = F.softplus(x)
@@ -250,7 +235,6 @@ class MoAKDALayer(nn.Module):
         imag = mu * torch.sin(phi)
         return torch.cat([real, imag], dim=-1)
 
-    @torch.compiler.disable
     def _kda_recursion(self, q, k, v, alpha, beta, T):
         B = q.shape[0]
         S = q.new_zeros(B, self.dk_pope, self.dv)
@@ -264,7 +248,7 @@ class MoAKDALayer(nn.Module):
     def _compute_active_pairs(self, stream, active_idx, active_h, active_e,
                               sel, probs, positions,
                               q_h_buf, k_h_buf, v_h_buf, alpha_buf, beta_buf,
-                              acc_pre_gate, acc_post_gate):
+                              acc_pre_gate):
         """Expert computation for a subset of active (h,e) pairs (e > 0 only).
         Scatter-adds into provided accumulators.
         Returns (H_res_contrib, H_post_contrib) for mHC accumulation.
@@ -282,11 +266,11 @@ class MoAKDALayer(nn.Module):
 
         H_res_k, H_pre_k, H_post_k = self.batched_mhc(stream, hi)
         stream_exp = stream.unsqueeze(0).expand(K, -1, -1, -1, -1)
-        h_e = _einsum('kbtn,kbntd->kbtd', H_pre_k, stream_exp)
+        h_e = torch.einsum('kbtn,kbntd->kbtd', H_pre_k, stream_exp)
 
         # Batched RMSNorm
         nw = self.batched_norm_w[hi]
-        rms = h_e.float().pow(2).mean(-1, keepdim=True).add(1e-8).rsqrt().to(h_e.dtype)
+        rms = h_e.pow(2).mean(-1, keepdim=True).add(1e-8).rsqrt()
         h_e = h_e * rms * nw.unsqueeze(1).unsqueeze(1)
 
         # STE mask (unified)
@@ -296,47 +280,44 @@ class MoAKDALayer(nn.Module):
 
         # ── Q projection ──
         lA_q = self.lora_A_q[fi]; lB_q = self.lora_B_q[fi]
-        delta_q = _einsum(
+        delta_q = torch.einsum(
             'kbtr,krd->kbtd',
-            F.silu(_einsum('kbtd,kdr->kbtr', h_e, lA_q)), lB_q)
+            F.silu(torch.einsum('kbtd,kdr->kbtr', h_e, lA_q)), lB_q)
         Wq = self.W_q_w[hi]
-        q_proj = _einsum('kbtd,kod->kbto', h_e, Wq)
+        q_proj = torch.einsum('kbtd,kod->kbto', h_e, Wq)
         q_out = self._apply_pope(
             F.normalize(q_proj + delta_q, dim=-1), positions, True)
 
         # ── K projection ──
         lA_k = self.lora_A_k[fi]; lB_k = self.lora_B_k[fi]
-        delta_k = _einsum(
+        delta_k = torch.einsum(
             'kbtr,krd->kbtd',
-            F.silu(_einsum('kbtd,kdr->kbtr', h_e, lA_k)), lB_k)
+            F.silu(torch.einsum('kbtd,kdr->kbtr', h_e, lA_k)), lB_k)
         Wk = self.W_k_w[hi]
-        k_proj = _einsum('kbtd,kod->kbto', h_e, Wk)
+        k_proj = torch.einsum('kbtd,kod->kbto', h_e, Wk)
         k_out = self._apply_pope(
             F.normalize(k_proj + delta_k, dim=-1), positions, False)
 
         # ── V projection ──
         lA_v = self.lora_A_v[fi]; lB_v = self.lora_B_v[fi]
-        delta_v = _einsum(
+        delta_v = torch.einsum(
             'kbtr,krd->kbtd',
-            F.silu(_einsum('kbtd,kdr->kbtr', h_e, lA_v)), lB_v)
+            F.silu(torch.einsum('kbtd,kdr->kbtr', h_e, lA_v)), lB_v)
         Wv = self.W_v_w[hi]
         v_out = F.silu(
-            _einsum('kbtd,kod->kbto', h_e, Wv) + delta_v)
+            torch.einsum('kbtd,kod->kbto', h_e, Wv) + delta_v)
 
         # ── Alpha, Beta ──
-        a_mid = _einsum('kbtd,kde->kbte', h_e, self.alpha_up_w[fi])
-        alpha_out = torch.sigmoid(_einsum(
+        a_mid = torch.einsum('kbtd,kde->kbte', h_e, self.alpha_up_w[fi])
+        alpha_out = torch.sigmoid(torch.einsum(
             'kbte,ked->kbtd', F.silu(a_mid), self.alpha_down_w[fi]))
-        b_mid = _einsum('kbtd,kde->kbte', h_e, self.beta_up_w[fi])
-        beta_out = torch.sigmoid(_einsum(
+        b_mid = torch.einsum('kbtd,kde->kbte', h_e, self.beta_up_w[fi])
+        beta_out = torch.sigmoid(torch.einsum(
             'kbte,ked->kbtd', F.silu(b_mid), self.beta_down_w[fi]))
 
         # ── Gates ──
-        pre_gate_out = F.silu(_einsum(
+        pre_gate_out = F.silu(torch.einsum(
             'kbtd,kde->kbte', h_e, self.W_pre_w[hi]))
-        pg_mid = _einsum('kbtd,kde->kbte', h_e, self.W_pg1_w[hi])
-        pg_out = torch.sigmoid(_einsum(
-            'kbte,ked->kbtd', F.silu(pg_mid), self.W_pg2_w[hi]))
 
         # ── Scatter-add to per-head buffers ──
         idx_h = hi.view(-1, 1, 1, 1)
@@ -346,14 +327,12 @@ class MoAKDALayer(nn.Module):
         eff_a = eff * alpha_out
         eff_b = eff * beta_out
         eff_pg = eff * pre_gate_out
-        eff_post = eff * pg_out
         q_h_buf.scatter_add_(0, idx_h.expand_as(eff_q), eff_q)
         k_h_buf.scatter_add_(0, idx_h.expand_as(eff_k), eff_k)
         v_h_buf.scatter_add_(0, idx_h.expand_as(eff_v), eff_v)
         alpha_buf.scatter_add_(0, idx_h.expand_as(eff_a), eff_a)
         beta_buf.scatter_add_(0, idx_h.expand_as(eff_b), eff_b)
         acc_pre_gate.scatter_add_(0, idx_h.expand_as(eff_pg), eff_pg)
-        acc_post_gate.scatter_add_(0, idx_h.expand_as(eff_post), eff_post)
 
         H_res_contrib = (H_res_k * eff.unsqueeze(-1)).sum(0)
         H_post_contrib = (H_post_k * eff).sum(0)
@@ -371,13 +350,13 @@ class MoAKDALayer(nn.Module):
         route_input = stream.mean(dim=1)                   # (B, T, d)
 
         # ════════════════ 1. Unified routing (all heads, always with grad) ════════════════
-        logits = _einsum('btd,hed->hbte', route_input, self.router_w)
+        logits = torch.einsum('btd,hed->hbte', route_input, self.router_w)
         logits = logits.clamp(-10, 10)                      # (H, B, T, E)
 
         probs = F.softmax(logits / ROUTE_TEMP, dim=-1)
 
         if self.training:
-            sel = torch.multinomial(probs.reshape(-1, E), 1).reshape(H, B, T)
+            sel = torch.multinomial(probs.view(-1, E), 1).view(H, B, T)
         else:
             sel = logits.argmax(dim=-1)                      # (H, B, T)
 
@@ -393,7 +372,7 @@ class MoAKDALayer(nn.Module):
         # ════════════════ 2. Identify active (h,e) pairs ════════════════
         e_range = torch.arange(E, device=stream.device)
         active = (sel.unsqueeze(-1) == e_range).any(dim=(1, 2))   # (H, E)
-        active_flat = active.reshape(-1)                            # (H*E,)
+        active_flat = active.view(-1)                            # (H*E,)
         active_idx = active_flat.nonzero(as_tuple=True)[0]
         active_h = active_idx // E                                  # (K,)
         active_e = active_idx % E
@@ -405,7 +384,6 @@ class MoAKDALayer(nn.Module):
         alpha_buf = stream.new_zeros(H, B, T, self.dk_pope)
         beta_buf  = stream.new_zeros(H, B, T, 1)
         acc_pre_gate  = stream.new_zeros(H, B, T, self.dv)
-        acc_post_gate = stream.new_zeros(H, B, T, d)
         acc_H_res  = stream.new_zeros(B, T, n, n)
         acc_H_post = stream.new_zeros(B, T, n)
 
@@ -417,7 +395,7 @@ class MoAKDALayer(nn.Module):
                     stream, active_idx[assigned], active_h[assigned], active_e[assigned],
                     sel, probs, positions,
                     q_h_buf, k_h_buf, v_h_buf, alpha_buf, beta_buf,
-                    acc_pre_gate, acc_post_gate)
+                    acc_pre_gate)
                 acc_H_res = acc_H_res + hr
                 acc_H_post = acc_H_post + hp
             if (~assigned).any():
@@ -426,7 +404,7 @@ class MoAKDALayer(nn.Module):
                         stream, active_idx[~assigned], active_h[~assigned], active_e[~assigned],
                         sel, probs, positions,
                         q_h_buf, k_h_buf, v_h_buf, alpha_buf, beta_buf,
-                        acc_pre_gate, acc_post_gate)
+                        acc_pre_gate)
                 acc_H_res = acc_H_res + hr
                 acc_H_post = acc_H_post + hp
         elif active_idx.numel() > 0:
@@ -434,7 +412,7 @@ class MoAKDALayer(nn.Module):
                 stream, active_idx, active_h, active_e,
                 sel, probs, positions,
                 q_h_buf, k_h_buf, v_h_buf, alpha_buf, beta_buf,
-                acc_pre_gate, acc_post_gate)
+                acc_pre_gate)
             acc_H_res = acc_H_res + hr
             acc_H_post = acc_H_post + hp
 
@@ -448,12 +426,12 @@ class MoAKDALayer(nn.Module):
         # ════════════════ 5. Batched KDA (all heads at once) ════════════════
         HB = H * B
         out_flat = self._kda_recursion(
-            q_h_buf.reshape(HB, T, self.dk_pope),
-            k_h_buf.reshape(HB, T, self.dk_pope),
-            v_h_buf.reshape(HB, T, self.dv),
-            alpha_buf.reshape(HB, T, self.dk_pope),
-            beta_buf.reshape(HB, T, 1), T)
-        out_he = out_flat.reshape(H, B, T, self.dv)
+            q_h_buf.view(HB, T, self.dk_pope),
+            k_h_buf.view(HB, T, self.dk_pope),
+            v_h_buf.view(HB, T, self.dv),
+            alpha_buf.view(HB, T, self.dk_pope),
+            beta_buf.view(HB, T, 1), T)
+        out_he = out_flat.view(H, B, T, self.dv)
 
         # Zero out where expert 0 selected
         out_he[zero_mask] = 0.0
@@ -462,18 +440,16 @@ class MoAKDALayer(nn.Module):
         gated_he = out_he * acc_pre_gate                    # (H, B, T, dv)
         prob_h = probs.gather(-1, sel.unsqueeze(-1)).squeeze(-1)
         gated_he = gated_he * prob_h.unsqueeze(-1)         # × routing prob
-        # per-expert W_o: compute all then gather，避免 (H,B,T,d,dv) 大张量
-        W = self.W_o_w.reshape(H, E, d, self.dv)           # (H, E, d, dv)
-        all_proj = torch.einsum('hbtv,hedv->hbted', gated_he, W)  # (H, B, T, E, d)
-        proj_he = all_proj.gather(
-            3, sel.reshape(H, B, T, 1, 1).expand(H, B, T, 1, d)).squeeze(3)
-        result_he = proj_he * acc_post_gate                # (H, B, T, d)
-        result = result_he.mean(0)                          # (B, T, d)
+        # Index-select W_o for selected experts (avoid full H×E projection)
+        flat_idx = (torch.arange(H, device=sel.device).view(H, 1, 1) * E + sel).view(-1)
+        W_sel = self.W_o_w[flat_idx].view(H, B, T, d, self.dv)
+        proj_he = torch.einsum('hbti,hbtdi->hbtd', gated_he, W_sel)  # (H, B, T, d)
+        result = proj_he.mean(0)                            # (B, T, d)
 
         H_res_avg  = acc_H_res / H
         H_post_avg = acc_H_post / H
-        res = _einsum('btij,bjtd->bitd', H_res_avg, stream)
-        post = _einsum('btn,btd->bntd', H_post_avg, result)
+        res = torch.einsum('btij,bjtd->bitd', H_res_avg, stream)
+        post = H_post_avg.transpose(1, 2).unsqueeze(-1) * result.unsqueeze(1)
         stream_update = res + post
 
         return stream_update, route_lp
@@ -532,19 +508,16 @@ class MoESwiGLU(nn.Module):
         self.swiglu_up_w   = nn.Parameter(torch.randn(n_heads, d_ffn, d_hidden) * 0.01)
         self.swiglu_down_w = nn.Parameter(torch.randn(n_heads, self.dh, d_ffn) * 0.01)
 
-        # Output: per-head preGate/postGate + per-expert W_o
+        # Output: per-head preGate + per-expert W_o
         self.W_pre_w = nn.Parameter(torch.randn(n_heads, d_hidden, self.dh) * 0.01)
         self.W_o_w   = nn.Parameter(torch.randn(FE, d_hidden, self.dh) * 0.01)
-        d_pg = max(int(d_hidden * 0.618), 1)
-        self.W_pg1_w = nn.Parameter(torch.randn(n_heads, d_hidden, d_pg) * 0.01)
-        self.W_pg2_w = nn.Parameter(torch.randn(n_heads, d_pg, d_hidden) * 0.01)
 
         # Expert embeddings for AttnRes query
         self.w_experts = nn.Parameter(torch.randn(FE, d_hidden) * 0.01)
 
     def _compute_active_pairs(self, stream, active_idx, active_f, active_ef,
                               sel, probs,
-                              out_buf, acc_pre_gate, acc_post_gate):
+                              out_buf, acc_pre_gate):
         """Expert computation for a subset of active (f,e) pairs (non-zero only).
         Scatter-adds into provided accumulators.
         Returns (H_res_contrib, H_post_contrib) for mHC accumulation.
@@ -562,10 +535,10 @@ class MoESwiGLU(nn.Module):
 
         H_res_k, H_pre_k, H_post_k = self.batched_mhc(stream, f_hi)
         stream_exp = stream.unsqueeze(0).expand(ki.shape[0], -1, -1, -1, -1)
-        h_e = _einsum('kbtn,kbntd->kbtd', H_pre_k, stream_exp)
+        h_e = torch.einsum('kbtn,kbntd->kbtd', H_pre_k, stream_exp)
 
         nw = self.batched_norm_w[f_hi]
-        rms = h_e.float().pow(2).mean(-1, keepdim=True).add(1e-8).rsqrt().to(h_e.dtype)
+        rms = h_e.pow(2).mean(-1, keepdim=True).add(1e-8).rsqrt()
         h_e = h_e * rms * nw.unsqueeze(1).unsqueeze(1)
 
         # STE mask
@@ -574,28 +547,22 @@ class MoESwiGLU(nn.Module):
         eff = (prob_k + (mask_k.to(prob_k.dtype) - prob_k).detach()).unsqueeze(-1)
 
         # SwiGLU
-        wd_out = _einsum('kbtd,kod->kbto', h_e, self.swiglu_wd_w[f_hi])
-        g = torch.sigmoid(_einsum('kbtd,kod->kbto', F.silu(wd_out), self.swiglu_wu_w[f_hi]))
-        gate_out = _einsum('kbtd,kod->kbto', h_e, self.swiglu_gate_w[f_hi])
-        up_out = _einsum('kbtd,kod->kbto', h_e, self.swiglu_up_w[f_hi])
-        swiglu_out = g * _einsum('kbtf,kof->kbto', F.silu(gate_out) * up_out, self.swiglu_down_w[f_hi])
+        wd_out = torch.einsum('kbtd,kod->kbto', h_e, self.swiglu_wd_w[f_hi])
+        g = torch.sigmoid(torch.einsum('kbtd,kod->kbto', F.silu(wd_out), self.swiglu_wu_w[f_hi]))
+        gate_out = torch.einsum('kbtd,kod->kbto', h_e, self.swiglu_gate_w[f_hi])
+        up_out = torch.einsum('kbtd,kod->kbto', h_e, self.swiglu_up_w[f_hi])
+        swiglu_out = g * torch.einsum('kbtf,kof->kbto', F.silu(gate_out) * up_out, self.swiglu_down_w[f_hi])
 
         eff_out = eff * swiglu_out
 
         # PreGate
-        pre_gate_out = F.silu(_einsum('kbtd,kde->kbte', h_e, self.W_pre_w[f_hi]))
+        pre_gate_out = F.silu(torch.einsum('kbtd,kde->kbte', h_e, self.W_pre_w[f_hi]))
         eff_pg = eff * pre_gate_out
-
-        # PostGate
-        pg_mid = _einsum('kbtd,kde->kbte', h_e, self.W_pg1_w[f_hi])
-        pg_out = torch.sigmoid(_einsum('kbte,ked->kbtd', F.silu(pg_mid), self.W_pg2_w[f_hi]))
-        eff_post = eff * pg_out
 
         # Scatter-accumulate to per-head buffers
         idx_f = f_hi.view(-1, 1, 1, 1)
         out_buf.scatter_add_(0, idx_f.expand_as(eff_out), eff_out)
         acc_pre_gate.scatter_add_(0, idx_f.expand_as(eff_pg), eff_pg)
-        acc_post_gate.scatter_add_(0, idx_f.expand_as(eff_post), eff_post)
 
         H_res_contrib = (H_res_k * eff.unsqueeze(-1)).sum(0)
         H_post_contrib = (H_post_k * eff).sum(0)
@@ -613,11 +580,11 @@ class MoESwiGLU(nn.Module):
         route_input = stream.mean(dim=1)                   # (B, T, d)
 
         # ════════════════ 1. Routing (all heads, always with grad) ════════════════
-        logits = _einsum('btd,fed->fbte', route_input, self.router_w).clamp(-10, 10)
+        logits = torch.einsum('btd,fed->fbte', route_input, self.router_w).clamp(-10, 10)
         probs = F.softmax(logits / ROUTE_TEMP, dim=-1)     # (nf, B, T, ne)
 
         if self.training:
-            sel = torch.multinomial(probs.reshape(-1, ne), 1).reshape(nf, B, T)
+            sel = torch.multinomial(probs.view(-1, ne), 1).view(nf, B, T)
         else:
             sel = logits.argmax(dim=-1)                     # (nf, B, T)
 
@@ -639,12 +606,12 @@ class MoESwiGLU(nn.Module):
         gate_moe.scatter_(-1,
                           flat_sel.permute(1, 2, 0).reshape(B * T, nf),
                           sel_probs.permute(1, 2, 0).reshape(B * T, nf))
-        gate_moe = gate_moe.reshape(B, T, FE)
+        gate_moe = gate_moe.view(B, T, FE)
 
         # ════════════════ 2. Active pairs ════════════════
         e_range = torch.arange(ne, device=stream.device)
         active = (sel.unsqueeze(-1) == e_range).any(dim=(1, 2))  # (nf, ne)
-        active_flat = active.reshape(-1)
+        active_flat = active.view(-1)
         active_idx = active_flat.nonzero(as_tuple=True)[0]
         active_f = active_idx // ne
         active_ef = active_idx % ne
@@ -653,7 +620,6 @@ class MoESwiGLU(nn.Module):
         dh = self.dh
         out_buf = stream.new_zeros(nf, B, T, dh)
         acc_pre_gate = stream.new_zeros(nf, B, T, dh)
-        acc_post_gate = stream.new_zeros(nf, B, T, d)
         acc_H_res = stream.new_zeros(B, T, n, n)
         acc_H_post = stream.new_zeros(B, T, n)
 
@@ -664,7 +630,7 @@ class MoESwiGLU(nn.Module):
                 hr, hp = self._compute_active_pairs(
                     stream, active_idx[assigned], active_f[assigned], active_ef[assigned],
                     sel, probs,
-                    out_buf, acc_pre_gate, acc_post_gate)
+                    out_buf, acc_pre_gate)
                 acc_H_res = acc_H_res + hr
                 acc_H_post = acc_H_post + hp
             if (~assigned).any():
@@ -672,7 +638,7 @@ class MoESwiGLU(nn.Module):
                     hr, hp = self._compute_active_pairs(
                         stream, active_idx[~assigned], active_f[~assigned], active_ef[~assigned],
                         sel, probs,
-                        out_buf, acc_pre_gate, acc_post_gate)
+                        out_buf, acc_pre_gate)
                 # 累加必须在 no_grad 外：保持 assigned heads 的梯度链
                 acc_H_res = acc_H_res + hr
                 acc_H_post = acc_H_post + hp
@@ -680,7 +646,7 @@ class MoESwiGLU(nn.Module):
             hr, hp = self._compute_active_pairs(
                 stream, active_idx, active_f, active_ef,
                 sel, probs,
-                out_buf, acc_pre_gate, acc_post_gate)
+                out_buf, acc_pre_gate)
             acc_H_res = acc_H_res + hr
             acc_H_post = acc_H_post + hp
 
@@ -694,21 +660,20 @@ class MoESwiGLU(nn.Module):
         # ════════════════ 5. Output assembly ════════════════
         out_buf[zero_mask] = 0.0
 
-        # Per-head preGate → × prob → per-expert W_o → per-head postGate
-        gated = out_buf * acc_pre_gate                     # (nf, B, T, d)
+        # Per-head preGate → × prob → per-expert W_o
+        gated = out_buf * acc_pre_gate                     # (nf, B, T, dh)
         gated = gated * sel_probs.unsqueeze(-1)            # × routing prob
-        W = self.W_o_w.reshape(nf, ne, self.d, self.dh)   # (nf, ne, d, dh)
-        all_proj = torch.einsum('fbti,feoi->fbteo', gated, W)  # (nf, B, T, ne, d)
-        proj = all_proj.gather(
-            3, sel.reshape(nf, B, T, 1, 1).expand(nf, B, T, 1, self.d)).squeeze(3)
-        result_he = proj * acc_post_gate                   # (nf, B, T, d)
-        result = result_he.mean(0)                          # (B, T, d)
+        # Index-select W_o for selected experts
+        flat_idx = (torch.arange(nf, device=sel.device).view(nf, 1, 1) * ne + sel).view(-1)
+        W_sel = self.W_o_w[flat_idx].view(nf, B, T, self.d, self.dh)
+        proj = torch.einsum('fbti,fbtdi->fbtd', gated, W_sel)  # (nf, B, T, d)
+        result = proj.mean(0)                              # (B, T, d)
 
         # mHC
         H_res_avg = acc_H_res / nf
         H_post_avg = acc_H_post / nf
-        res = _einsum('btij,bjtd->bitd', H_res_avg, stream)
-        post = _einsum('btn,btd->bntd', H_post_avg, result)
+        res = torch.einsum('btij,bjtd->bitd', H_res_avg, stream)
+        post = H_post_avg.transpose(1, 2).unsqueeze(-1) * result.unsqueeze(1)
         stream_update = res + post
 
         return stream_update, gate_moe, route_lp
@@ -799,16 +764,14 @@ class KDAPolicyNetwork(nn.Module):
         self._init_weights()
 
     def _init_weights(self):
-        depth = self.max_iterations * self.inner_steps
-        scale = depth ** -0.5
         nn.init.normal_(self.moa_kda.W_o_w,
-                        std=scale * (2.0 / self.moa_kda.dv) ** 0.5)
+                        std=(2.0 / self.moa_kda.dv) ** 0.5)
         nn.init.normal_(self.moe_swiglu.swiglu_down_w,
-                        std=scale * (2.0 / self.moe_swiglu.swiglu_down_w.shape[-1]) ** 0.5)
+                        std=(2.0 / self.moe_swiglu.swiglu_down_w.shape[-1]) ** 0.5)
         nn.init.normal_(self.moe_swiglu.W_o_w,
-                        std=scale * (2.0 / self.moe_swiglu.d) ** 0.5)
+                        std=(2.0 / self.moe_swiglu.d) ** 0.5)
         nn.init.normal_(self.head_down.weight,
-                        std=scale * (2.0 / self.head_down.in_features) ** 0.5)
+                        std=(2.0 / self.head_down.in_features) ** 0.5)
         nn.init.normal_(self.preH_iter.weight,
                         std=(2.0 / self.preH_iter.weight.shape[1]) ** 0.5)
         nn.init.normal_(self.preH_final.weight,
@@ -832,11 +795,11 @@ class KDAPolicyNetwork(nn.Module):
             scale = (gate_moe @ self.attn_res_expert_scales) / weights  # (B,T,d)
         K = V / (rms + 1e-8) * scale
         if w_l.dim() == 1:
-            logits = _einsum('d,lbtd->lbt', w_l, K)
+            logits = (K * w_l).sum(-1)
         else:                                             # (B, T, d) per-token
-            logits = _einsum('btd,lbtd->lbt', w_l, K)
+            logits = (K * w_l.unsqueeze(0)).sum(-1)
         alpha = logits.softmax(0)
-        return _einsum('lbt,lbtd->btd', alpha, V)
+        return (alpha.unsqueeze(-1) * V).sum(0)
 
     @torch.compiler.disable
     def _loop(self, stream, acc, attn_head_mask=None, ffn_head_mask=None):
@@ -884,9 +847,9 @@ class KDAPolicyNetwork(nn.Module):
             stream_pre = stream
 
             # ── Inner loop: INNER_STEPS × (MoA + MoE) ──
-            # 用 list 收集 + stack，避免 512 次 += 创建 512 个中间 tensor 爆显存
-            gate_moes = []
-            mean_query_parts = []
+            # Running sum 替代 list+stack，避免大中间张量
+            gate_moe_sum = None
+            mean_query_sum = None
             for j in range(self.inner_steps):
                 if GRADIENT_CHECKPOINTING:
                     attn_update, moa_lp = cp.checkpoint(
@@ -906,18 +869,22 @@ class KDAPolicyNetwork(nn.Module):
                 route_lp_total = route_lp_total + moe_lp.sum(-1)
                 route_lp_count += 1
 
-                mean_query_parts.append(_einsum(
-                    'bte,ed->btd', gate_moe, self.moe_swiglu.w_experts))
-                gate_moes.append(gate_moe)
-            mean_query = torch.stack(mean_query_parts).mean(0)
-            gate_moe_avg = torch.stack(gate_moes).mean(0)
+                mq = gate_moe @ self.moe_swiglu.w_experts       # (B, T, d)
+                if gate_moe_sum is None:
+                    gate_moe_sum = gate_moe
+                    mean_query_sum = mq
+                else:
+                    gate_moe_sum = gate_moe_sum + gate_moe
+                    mean_query_sum = mean_query_sum + mq
+            mean_query = mean_query_sum / self.inner_steps
+            gate_moe_avg = gate_moe_sum / self.inner_steps
 
             # AttnRes (once per outer step)
             stream = stream + self._attn_res(
                 acc, mean_query, self.preH_iter, gate_moe_avg).unsqueeze(1)
 
             # Gate: continue → updated, exit → previous
-            stream = gate_4d * stream + (1 - gate_4d) * stream_pre
+            stream = torch.lerp(stream_pre, stream, gate_4d)
 
             acc.append(stream)
 
