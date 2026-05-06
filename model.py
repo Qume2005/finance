@@ -460,10 +460,11 @@ class MoAKDALayer(nn.Module):
         gated_he = out_he * acc_pre_gate                    # (H, B, T, dv)
         prob_h = probs.gather(-1, sel.unsqueeze(-1)).squeeze(-1)
         gated_he = gated_he * prob_h.unsqueeze(-1)         # × routing prob
-        h_idx = torch.arange(H, device=stream.device).view(H, 1, 1)
-        flat_idx = h_idx * E + sel                          # (H, B, T)
-        W_o_token = self.W_o_w[flat_idx]                   # (H, B, T, d, dv)
-        proj_he = _einsum('hbtv,hbtdv->hbtd', gated_he, W_o_token)
+        # per-expert W_o: compute all then gather，避免 (H,B,T,d,dv) 大张量
+        W = self.W_o_w.reshape(H, E, d, self.dv)           # (H, E, d, dv)
+        all_proj = torch.einsum('hbtv,hedv->hbted', gated_he, W)  # (H, B, T, E, d)
+        proj_he = all_proj.gather(
+            3, sel.unsqueeze(-1).expand(H, B, T, 1, d)).squeeze(3)
         result_he = proj_he * acc_post_gate                # (H, B, T, d)
         result = result_he.mean(0)                          # (B, T, d)
 
@@ -694,9 +695,10 @@ class MoESwiGLU(nn.Module):
         # Per-head preGate → × prob → per-expert W_o → per-head postGate
         gated = out_buf * acc_pre_gate                     # (nf, B, T, d)
         gated = gated * sel_probs.unsqueeze(-1)            # × routing prob
-        flat_idx = f_arange * ne + sel                     # (nf, B, T)
-        W_o_token = self.W_o_w[flat_idx]                   # (nf, B, T, d, d)
-        proj = _einsum('hbtd,hbted->hbte', gated, W_o_token)  # (nf, B, T, d)
+        W = self.W_o_w.reshape(nf, ne, self.d, self.dh)   # (nf, ne, d, dh)
+        all_proj = torch.einsum('fbti,feoi->fbteo', gated, W)  # (nf, B, T, ne, d)
+        proj = all_proj.gather(
+            3, sel.unsqueeze(-1).expand(nf, B, T, 1, self.d)).squeeze(3)
         result_he = proj * acc_post_gate                   # (nf, B, T, d)
         result = result_he.mean(0)                          # (B, T, d)
 
