@@ -43,9 +43,15 @@ def backtest_series(policy, feats, rets, label="", quiet=False):
         if pad:
             f = torch.cat([f, f.new_zeros(pad, D)], dim=0)
 
-        # 所有窗口作为 batch 并行 forward
+        # 逐窗口 forward（避免大 batch 打爆显存）
         windows = f.reshape(n_w, EPISODE_LEN, D)         # (n_w, EPISODE_LEN, D)
-        logits, exit_iters_w, _, _ = policy(windows)     # logits: (n_w, n_actions)
+        all_logits, all_exit = [], []
+        for w in windows:
+            logits_w, exit_w, _, _ = policy(w.unsqueeze(0))
+            all_logits.append(logits_w.squeeze(0))
+            all_exit.append(exit_w.squeeze(0))
+        logits = torch.stack(all_logits)                  # (n_w, n_actions)
+        exit_iters_w = torch.stack(all_exit)              # (n_w,)
 
         # Shift: window i's action → timesteps [(i+1)*EPISODE_LEN : (i+2)*EPISODE_LEN]
         # First EPISODE_LEN timesteps: neutral position 5
