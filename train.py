@@ -166,23 +166,43 @@ class GRPOTrainer:
             sd["moa_kda.router_w"] = sd.pop("moa_kda.q_router_w")
             sd.pop("moa_kda.kv_router_w", None)
         clean_sd = {k.replace("_orig_mod.", ""): v for k, v in sd.items()}
-        # 只加载形状匹配的参数（架构变更后自动跳过不兼容的）
         model_sd = self.model.state_dict()
-        loaded, skipped = {}, []
+        loaded, upcasted, skipped = {}, [], []
         for k, v in clean_sd.items():
-            if k in model_sd and v.shape == model_sd[k].shape:
+            if k not in model_sd:
+                continue
+            tgt = model_sd[k]
+            if v.shape == tgt.shape:
                 loaded[k] = v
-            elif k in model_sd:
-                skipped.append(f"{k}: {v.shape}→{model_sd[k].shape}")
+            elif len(v.shape) == len(tgt.shape) and all(
+                    t >= s for t, s in zip(tgt.shape, v.shape)):
+                # 目标每维 ≥ 源 → 居中嵌入
+                new_p = tgt.clone()
+                slices = tuple(slice((t - s) // 2, (t - s) // 2 + s)
+                               for t, s in zip(tgt.shape, v.shape))
+                new_p[slices] = v
+                loaded[k] = new_p
+                upcasted.append(f"{k}: {tuple(v.shape)}→{tuple(tgt.shape)}")
+            else:
+                skipped.append(f"{k}: {tuple(v.shape)}→{tuple(tgt.shape)}")
         self.model.load_state_dict(loaded, strict=False)
-        if skipped:
-            print(f"  WARNING: {len(skipped)} params skipped (architecture changed):")
-            for s in skipped[:5]:
-                print(f"    {s}")
-            if len(skipped) > 5:
-                print(f"    ... and {len(skipped)-5} more")
-            print(f"  Training will resume from scratch for incompatible params.")
-        # 优化器仅在没有跳过参数时才恢复（否则梯度状态不一致）
+        if upcasted or skipped:
+            n_exact = len(loaded) - len(upcasted)
+            print(f"  Loaded {n_exact} exact, "
+                  f"upcasted {len(upcasted)}, skipped {len(skipped)}")
+            if upcasted:
+                print("  Upcasted:")
+                for s in upcasted[:5]:
+                    print(f"    {s}")
+                if len(upcasted) > 5:
+                    print(f"    ... and {len(upcasted)-5} more")
+            if skipped:
+                print("  Skipped (incompatible):")
+                for s in skipped[:5]:
+                    print(f"    {s}")
+                if len(skipped) > 5:
+                    print(f"    ... and {len(skipped)-5} more")
+        # 有 skip → 不恢复优化器（形状不兼容）；仅 upcast → 可恢复
         if not skipped:
             self.muon_opt.load_state_dict(ckpt["muon_opt"])
             self.sgd_opt.load_state_dict(ckpt["sgd_opt"])
