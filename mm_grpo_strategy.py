@@ -25,7 +25,7 @@ from data import prepare_datasets, prepare_test_data
 from train import GRPOTrainer
 from evaluate import (
     plot_prices, plot_training_curves, run_backtest, plot_results,
-    export_results, save_model, print_conclusions,
+    export_results, save_model, print_conclusions, backtest_series,
 )
 
 
@@ -75,7 +75,8 @@ def run_multi_gpu(n_gpus):
 
         def setup(self, seed):
             data = prepare_datasets(self.device, seed=seed)
-            self.trainer.setup(data["train_feats"], data["train_rets"])
+            self.trainer.setup(data["train_feats"], data["train_rets"],
+                               data["feat_mean"], data["feat_std"])
 
         def init_nccl(self, master_addr, port):
             self.trainer.init_nccl(master_addr, port)
@@ -91,6 +92,25 @@ def run_multi_gpu(n_gpus):
 
         def get_start_ep(self):
             return self.trainer.get_start_ep()
+
+        def get_model_state(self):
+            return self.trainer.get_model_state()
+
+        def get_feat_stats(self):
+            return self.trainer.get_feat_stats()
+
+        def evaluate(self, model_state, test_feats_shard, test_rets_shard, test_ids_shard):
+            """eval 模式跑 backtest（多卡并行）。"""
+            from model import KDAPolicyNetwork
+            model = KDAPolicyNetwork().to(self.device)
+            model.load_state_dict({k: v.to(self.device) for k, v in model_state.items()})
+            model.eval()
+            results = []
+            for i, sid in enumerate(test_ids_shard):
+                r = backtest_series(model, test_feats_shard[i], test_rets_shard[i],
+                                    label=f"Test Series {sid}")
+                results.append((i, r))
+            return results
 
     print(f"Ray initialized with {n_gpus} GPUs")
 
@@ -141,7 +161,6 @@ def run_multi_gpu(n_gpus):
 
     try:
         for ep in range(start_ep, N_EPISODES + 1):
-            # Single round-trip: workers sync gradients via NCCL internally
             metrics = ray.get([w.step.remote(ep) for w in workers])
 
             m = metrics[0]
@@ -174,6 +193,48 @@ def run_multi_gpu(n_gpus):
 
     print(f"Training {'interrupted' if last_ep < N_EPISODES else 'done'} "
           f"at step {last_ep} ({time.time()-t0:.1f}s)")
+
+    # ── Evaluation on all GPUs ──
+    plot_training_curves(history, output_dir=OUTPUT_DIR)
+
+    print("\nEvaluating on {} GPUs...".format(n_gpus))
+    state_dict = ray.get(workers[0].get_model_state.remote())
+    feat_mean, feat_std = ray.get(workers[0].get_feat_stats.remote())
+
+    torch.save(state_dict, os.path.join(OUTPUT_DIR, "policy.pt"))
+    print(f"Model saved → {os.path.join(OUTPUT_DIR, 'policy.pt')}")
+
+    test_data = prepare_test_data(torch.device("cpu"), feat_mean.cpu(), feat_std.cpu())
+    plot_prices(test_data["prices_list"], output_dir=OUTPUT_DIR)
+
+    # Shard test series across workers
+    test_ids = list(range(len(test_data["test_feats"])))
+    shards = [[] for _ in range(n_gpus)]
+    for i, sid in enumerate(test_ids):
+        shards[i % n_gpus].append(sid)
+
+    eval_args = []
+    for shard in shards:
+        feats_shard = [test_data["test_feats"][sid] for sid in shard]
+        rets_shard = [test_data["test_rets"][sid] for sid in shard]
+        eval_args.append((feats_shard, rets_shard, shard))
+
+    all_results = ray.get([
+        w.evaluate.remote(state_dict, feats_s, rets_s, ids_s)
+        for w, (feats_s, rets_s, ids_s) in zip(workers, eval_args)
+    ])
+
+    # Merge results preserving original order
+    results = [None] * len(test_ids)
+    for worker_idx, shard_results in enumerate(all_results):
+        for local_i, r in shard_results:
+            sid = shards[worker_idx][local_i]
+            results[test_ids.index(sid)] = r
+
+    plot_results(results, output_dir=OUTPUT_DIR)
+    export_results(results, history)
+    print_conclusions()
+
     ray.shutdown()
 
 

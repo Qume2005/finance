@@ -880,8 +880,9 @@ class KDAPolicyNetwork(nn.Module):
             stream_pre = stream
 
             # ── Inner loop: INNER_STEPS × (MoA + MoE) ──
-            mean_query = stream.new_zeros(B, T_total, d)
-            gate_moe_sum = stream.new_zeros(B, T_total, self.moe_swiglu.FE)
+            # 用 list 收集 + stack，避免 512 次 += 创建 512 个中间 tensor 爆显存
+            gate_moes = []
+            mean_query_parts = []
             for j in range(self.inner_steps):
                 if GRADIENT_CHECKPOINTING:
                     attn_update, moa_lp = cp.checkpoint(
@@ -901,11 +902,11 @@ class KDAPolicyNetwork(nn.Module):
                 route_lp_total = route_lp_total + moe_lp.sum(-1)
                 route_lp_count += 1
 
-                mean_query = mean_query + _einsum(
-                    'bte,ed->btd', gate_moe, self.moe_swiglu.w_experts)
-                gate_moe_sum = gate_moe_sum + gate_moe
-            mean_query = mean_query / self.inner_steps
-            gate_moe_avg = gate_moe_sum / self.inner_steps
+                mean_query_parts.append(_einsum(
+                    'bte,ed->btd', gate_moe, self.moe_swiglu.w_experts))
+                gate_moes.append(gate_moe)
+            mean_query = torch.stack(mean_query_parts).mean(0)
+            gate_moe_avg = torch.stack(gate_moes).mean(0)
 
             # AttnRes (once per outer step)
             stream = stream + self._attn_res(

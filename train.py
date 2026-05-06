@@ -117,13 +117,15 @@ class GRPOTrainer:
         self.world_size = world_size
         self.is_main = (rank == 0)
 
-    def setup(self, train_feats, train_rets):
+    def setup(self, train_feats, train_rets, feat_mean=None, feat_std=None):
         """Create model, optimizers, load checkpoint, init prefetcher."""
         np.random.seed(SEED + self.rank)
         torch.manual_seed(SEED + self.rank)
 
         self.train_feats = train_feats
         self.train_rets = train_rets
+        self.feat_mean = feat_mean
+        self.feat_std = feat_std
 
         from model import KDAPolicyNetwork
         self.model = KDAPolicyNetwork().to(self.device)
@@ -356,6 +358,14 @@ class GRPOTrainer:
         return {n: p.grad.cpu().clone()
                 for n, p in self.model.named_parameters()
                 if p.grad is not None}
+
+    def get_model_state(self):
+        """Return model state_dict on CPU."""
+        return {k: v.cpu() for k, v in self.model.state_dict().items()}
+
+    def get_feat_stats(self):
+        """Return (feat_mean, feat_std) tensors on CPU."""
+        return self.feat_mean, self.feat_std
 
     def apply_gradients(self, avg_grads):
         """Set averaged gradients, clip, step optimizer, update scaler."""
