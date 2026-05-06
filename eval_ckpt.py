@@ -62,7 +62,8 @@ def _eval_single(state_dict, test_data):
 
 
 def _eval_multi_gpu(state_dict, test_data, n_gpus):
-    """多卡并行评估（Ray actors），顺序输出结果。"""
+    """多卡并行评估：任务队列动态分派，顺序输出结果。"""
+    from collections import deque
     import ray
 
     if not ray.is_initialized():
@@ -70,53 +71,54 @@ def _eval_multi_gpu(state_dict, test_data, n_gpus):
 
     @ray.remote(num_gpus=1)
     class EvalWorker:
-        def __init__(self):
+        def __init__(self, model_state):
             self.device = torch.device("cuda")
+            self.model = KDAPolicyNetwork().to(self.device)
+            self.model.load_state_dict(
+                {k: v.to(self.device) for k, v in model_state.items()})
+            self.model.eval()
 
-        def evaluate(self, model_state, test_feats_shard, test_rets_shard, test_ids_shard):
-            model = KDAPolicyNetwork().to(self.device)
-            model.load_state_dict({k: v.to(self.device) for k, v in model_state.items()})
-            model.eval()
-            results = []
-            for i, sid in enumerate(test_ids_shard):
-                r = backtest_series(model, test_feats_shard[i], test_rets_shard[i],
-                                    label=f"Test Series {sid}", quiet=True)
-                results.append((sid, r))
-            return results
+        def eval_one(self, feats, rets, sid):
+            r = backtest_series(self.model, feats, rets,
+                                label=f"Test Series {sid}", quiet=True)
+            return (sid, r)
 
     print(f"\nEvaluating on {n_gpus} GPUs...")
 
-    # 均匀切分 test series
-    test_ids = list(range(len(test_data["test_feats"])))
-    shards = [[] for _ in range(n_gpus)]
-    for i, sid in enumerate(test_ids):
-        shards[i % n_gpus].append(sid)
-
-    workers = [EvalWorker.remote() for _ in range(n_gpus)]
-    eval_args = []
-    for shard in shards:
-        feats_shard = [test_data["test_feats"][sid] for sid in shard]
-        rets_shard = [test_data["test_rets"][sid] for sid in shard]
-        eval_args.append((feats_shard, rets_shard, shard))
-
-    # 提交所有任务
-    pending = {}
-    for idx, (w, (feats_s, rets_s, ids_s)) in enumerate(zip(workers, eval_args)):
-        ref = w.evaluate.remote(state_dict, feats_s, rets_s, ids_s)
-        pending[ref] = idx
-
-    # 用 ray.wait 逐个收取，缓冲后顺序输出
-    results = [None] * len(test_ids)
+    n_series = len(test_data["test_feats"])
+    workers = [EvalWorker.remote(state_dict) for _ in range(n_gpus)]
+    task_queue = deque(range(n_series))
+    results = [None] * n_series
     next_print = 0
 
+    # pending: ref -> worker
+    pending = {}
+
+    # 初始：每个 worker 派一个任务
+    for w in workers:
+        if not task_queue:
+            break
+        sid = task_queue.popleft()
+        ref = w.eval_one.remote(test_data["test_feats"][sid],
+                                test_data["test_rets"][sid], sid)
+        pending[ref] = w
+
+    # 动态分派：worker 完成后从队列取下一个
     while pending:
         done, _ = ray.wait(list(pending.keys()), num_returns=1)
         for ref in done:
-            shard_idx = pending.pop(ref)
-            for sid, r in ray.get(ref):
-                results[sid] = r
-            # 有新结果就尝试顺序输出
-            while next_print < len(results) and results[next_print] is not None:
+            w = pending.pop(ref)
+            sid, r = ray.get(ref)
+            results[sid] = r
+            # 队列非空则继续派
+            if task_queue:
+                next_sid = task_queue.popleft()
+                new_ref = w.eval_one.remote(test_data["test_feats"][next_sid],
+                                            test_data["test_rets"][next_sid],
+                                            next_sid)
+                pending[new_ref] = w
+            # 顺序输出
+            while next_print < n_series and results[next_print] is not None:
                 print_backtest_result(results[next_print],
                                       f"Test Series {next_print}")
                 next_print += 1
