@@ -321,7 +321,7 @@ def prepare_datasets(device, seed=None):
     mt_choices = ["main", "chinext", "star"]
     mt_weights = [0.60, 0.25, 0.15]
 
-    print(f"  Generating {N_TRAIN_SERIES} train series (GPU, seed={seed})...")
+    print(f"  Generating {N_TRAIN_SERIES} series (GPU, seed={seed})...")
     train_feats, train_rets, feat_mean, feat_std, _ = _generate_block_gpu(
         N_TRAIN_SERIES, N_TRAIN_DAYS, param_rng, seed, device,
         mt_choices, mt_weights)

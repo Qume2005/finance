@@ -15,7 +15,21 @@ from config import TEST_IDS, OUTPUT_DIR, EPISODE_LEN, MAX_ITERATIONS
 
 # ────────────────── Backtest ──────────────────
 
-def backtest_series(policy, feats, rets, label=""):
+def print_backtest_result(result, label=""):
+    """打印单条 backtest 结果的指标表。"""
+    m = result["metrics"]
+    print(f"\n{'='*55}")
+    print(f"  {label}")
+    print(f"{'='*55}")
+    print(f"  {'Metric':<20} {'Strategy':>14} {'Buy&Hold':>14}")
+    print(f"  {'-'*48}")
+    print(f"  {'Total Return':<20} {m['strat_total']:>13.2f}x {m['bh_total']:>13.2f}x")
+    print(f"  {'Max Drawdown':<20} {m['strat_maxdd']:>13.2%} {m['bh_maxdd']:>13.2%}")
+    print(f"  {'Sharpe (ann.)':<20} {m['strat_sharpe']:>13.2f}  {m['bh_sharpe']:>13.2f}")
+    print(f"  {'Calmar':<20} {m['strat_calmar']:>13.2f}  {m['bh_calmar']:>13.2f}")
+
+
+def backtest_series(policy, feats, rets, label="", quiet=False):
     """Run backtest with parallel sliding window (same as train)."""
     device = next(policy.parameters()).device
     feats = feats.to(device)
@@ -76,18 +90,8 @@ def backtest_series(policy, feats, rets, label=""):
         "strat_calmar": strat_calmar, "bh_calmar": bh_calmar,
     }
 
-    print(f"\n{'='*55}")
-    print(f"  {label}")
-    print(f"{'='*55}")
-    print(f"  {'Metric':<20} {'Strategy':>14} {'Buy&Hold':>14}")
-    print(f"  {'-'*48}")
-    print(f"  {'Total Return':<20} {strat_total:>13.2f}x {bh_total:>13.2f}x")
-    print(f"  {'Max Drawdown':<20} {strat_maxdd:>13.2%} {bh_maxdd:>13.2%}")
-    print(f"  {'Sharpe (ann.)':<20} {strat_sharpe:>13.2f}  {bh_sharpe:>13.2f}")
-    print(f"  {'Calmar':<20} {strat_calmar:>13.2f}  {bh_calmar:>13.2f}")
-
     # numpy only at the boundary for matplotlib
-    return {
+    result = {
         "metrics": metrics,
         "positions": positions.cpu().numpy(),
         "exit_iters": exit_iters,
@@ -97,6 +101,9 @@ def backtest_series(policy, feats, rets, label=""):
         "bh_dd": bh_dd.cpu().numpy(),
         "rets": rets_f.cpu().numpy(),
     }
+    if not quiet:
+        print_backtest_result(result, label)
+    return result
 
 
 def run_backtest(policy, test_feats, test_rets, test_ids=None):

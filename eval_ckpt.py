@@ -10,6 +10,7 @@ from model import KDAPolicyNetwork
 from evaluate import (
     plot_prices, plot_training_curves, run_backtest, plot_results,
     export_results, save_model, print_conclusions, backtest_series,
+    print_backtest_result,
 )
 
 
@@ -61,7 +62,7 @@ def _eval_single(state_dict, test_data):
 
 
 def _eval_multi_gpu(state_dict, test_data, n_gpus):
-    """多卡并行评估（Ray actors）。"""
+    """多卡并行评估（Ray actors），顺序输出结果。"""
     import ray
 
     if not ray.is_initialized():
@@ -79,8 +80,8 @@ def _eval_multi_gpu(state_dict, test_data, n_gpus):
             results = []
             for i, sid in enumerate(test_ids_shard):
                 r = backtest_series(model, test_feats_shard[i], test_rets_shard[i],
-                                    label=f"Test Series {sid}")
-                results.append((i, r))
+                                    label=f"Test Series {sid}", quiet=True)
+                results.append((sid, r))
             return results
 
     print(f"\nEvaluating on {n_gpus} GPUs...")
@@ -98,17 +99,27 @@ def _eval_multi_gpu(state_dict, test_data, n_gpus):
         rets_shard = [test_data["test_rets"][sid] for sid in shard]
         eval_args.append((feats_shard, rets_shard, shard))
 
-    all_results = ray.get([
-        w.evaluate.remote(state_dict, feats_s, rets_s, ids_s)
-        for w, (feats_s, rets_s, ids_s) in zip(workers, eval_args)
-    ])
+    # 提交所有任务
+    pending = {}
+    for idx, (w, (feats_s, rets_s, ids_s)) in enumerate(zip(workers, eval_args)):
+        ref = w.evaluate.remote(state_dict, feats_s, rets_s, ids_s)
+        pending[ref] = idx
 
-    # 合并结果（保持原始顺序）
+    # 用 ray.wait 逐个收取，缓冲后顺序输出
     results = [None] * len(test_ids)
-    for worker_idx, shard_results in enumerate(all_results):
-        for local_i, r in shard_results:
-            sid = shards[worker_idx][local_i]
-            results[test_ids.index(sid)] = r
+    next_print = 0
+
+    while pending:
+        done, _ = ray.wait(list(pending.keys()), num_returns=1)
+        for ref in done:
+            shard_idx = pending.pop(ref)
+            for sid, r in ray.get(ref):
+                results[sid] = r
+            # 有新结果就尝试顺序输出
+            while next_print < len(results) and results[next_print] is not None:
+                print_backtest_result(results[next_print],
+                                      f"Test Series {next_print}")
+                next_print += 1
 
     return results
 
