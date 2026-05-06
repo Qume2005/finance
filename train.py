@@ -202,8 +202,8 @@ class GRPOTrainer:
                     print(f"    {s}")
                 if len(skipped) > 5:
                     print(f"    ... and {len(skipped)-5} more")
-        # 有 skip → 不恢复优化器（形状不兼容）；仅 upcast → 可恢复
-        if not skipped:
+        # 有 skip 或 upcast → 不恢复优化器（buffer 形状不匹配）
+        if not skipped and not upcasted:
             self.muon_opt.load_state_dict(ckpt["muon_opt"])
             self.sgd_opt.load_state_dict(ckpt["sgd_opt"])
             self.start_ep = ckpt["step"] + 1
