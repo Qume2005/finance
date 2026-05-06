@@ -198,8 +198,8 @@ class MoAKDALayer(nn.Module):
         self.H = n_heads
         self.E = n_experts_per_head
         self.n_mhc = n_mhc
-        r_qk = max(min(d_key, d_input) // n_heads, 1)   # LoRA rank Q/K
-        r_v  = max(min(self.dv, d_input) // n_heads, 1)  # LoRA rank V
+        r_qk = max(min(d_key, d_input) // n_experts_per_head, 1)   # LoRA rank Q/K
+        r_v  = max(min(self.dv, d_input) // n_experts_per_head, 1)  # LoRA rank V
 
         # ── Positional encoding ──
         self.register_buffer(
