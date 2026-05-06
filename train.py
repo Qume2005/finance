@@ -165,19 +165,39 @@ class GRPOTrainer:
         if "moa_kda.q_router_w" in sd:
             sd["moa_kda.router_w"] = sd.pop("moa_kda.q_router_w")
             sd.pop("moa_kda.kv_router_w", None)
-        self.model.load_state_dict({k.replace("_orig_mod.", ""): v
-                                    for k, v in ckpt["model"].items()})
-        self.muon_opt.load_state_dict(ckpt["muon_opt"])
-        self.sgd_opt.load_state_dict(ckpt["sgd_opt"])
-        self.start_ep = ckpt["step"] + 1
+        clean_sd = {k.replace("_orig_mod.", ""): v for k, v in sd.items()}
+        # 只加载形状匹配的参数（架构变更后自动跳过不兼容的）
+        model_sd = self.model.state_dict()
+        loaded, skipped = {}, []
+        for k, v in clean_sd.items():
+            if k in model_sd and v.shape == model_sd[k].shape:
+                loaded[k] = v
+            elif k in model_sd:
+                skipped.append(f"{k}: {v.shape}→{model_sd[k].shape}")
+        self.model.load_state_dict(loaded, strict=False)
+        if skipped:
+            print(f"  WARNING: {len(skipped)} params skipped (architecture changed):")
+            for s in skipped[:5]:
+                print(f"    {s}")
+            if len(skipped) > 5:
+                print(f"    ... and {len(skipped)-5} more")
+            print(f"  Training will resume from scratch for incompatible params.")
+        # 优化器仅在没有跳过参数时才恢复（否则梯度状态不一致）
+        if not skipped:
+            self.muon_opt.load_state_dict(ckpt["muon_opt"])
+            self.sgd_opt.load_state_dict(ckpt["sgd_opt"])
+            self.start_ep = ckpt["step"] + 1
+            if "scaler" in ckpt:
+                self.scaler.load_state_dict(ckpt["scaler"])
+            for _ in range(ckpt["step"]):
+                for sch in self.schedulers:
+                    sch.step()
+        else:
+            self.start_ep = 1
         self.history = ckpt.get("history", self.history)
-        if "scaler" in ckpt:
-            self.scaler.load_state_dict(ckpt["scaler"])
         if self.is_main:
-            print(f"Resumed from {ckpt_path} (step {ckpt['step']})")
-        for _ in range(ckpt["step"]):
-            for sch in self.schedulers:
-                sch.step()
+            print(f"Resumed from {ckpt_path} (step {ckpt['step']}, "
+                  f"loaded {len(loaded)}/{len(model_sd)} params)")
 
     def _sample_series_batch(self):
         T = self.train_feats[0].shape[0]

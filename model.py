@@ -198,7 +198,8 @@ class MoAKDALayer(nn.Module):
         self.H = n_heads
         self.E = n_experts_per_head
         self.n_mhc = n_mhc
-        r = max(d_key // 4, 1)                          # LoRA rank
+        r_qk = max(min(d_key, d_input) // n_heads, 1)   # LoRA rank Q/K
+        r_v  = max(min(self.dv, d_input) // n_heads, 1)  # LoRA rank V
 
         # ── Positional encoding ──
         self.register_buffer(
@@ -213,31 +214,32 @@ class MoAKDALayer(nn.Module):
         # ── Per-head router (unified Q+KV) ──
         self.router_w = nn.Parameter(torch.randn(n_heads, n_experts_per_head, d_input) * 0.01)
 
-        # ── Unified expert params (flat: idx = h*E + e) ──
+        # ── Per-expert LoRA (flat: idx = h*E + e) ──
         HE = n_heads * n_experts_per_head
-        self.lora_A_q = nn.Parameter(torch.randn(HE, d_input, r) * 0.01)
-        self.lora_B_q = nn.Parameter(torch.zeros(HE, r, d_key))
-        self.lora_A_k = nn.Parameter(torch.randn(HE, d_input, r) * 0.01)
-        self.lora_B_k = nn.Parameter(torch.zeros(HE, r, d_key))
-        self.lora_A_v = nn.Parameter(torch.randn(HE, d_input, r) * 0.01)
-        self.lora_B_v = nn.Parameter(torch.zeros(HE, r, self.dv))
+        self.lora_A_q = nn.Parameter(torch.randn(HE, d_input, r_qk) * 0.01)
+        self.lora_B_q = nn.Parameter(torch.zeros(HE, r_qk, d_key))
+        self.lora_A_k = nn.Parameter(torch.randn(HE, d_input, r_qk) * 0.01)
+        self.lora_B_k = nn.Parameter(torch.zeros(HE, r_qk, d_key))
+        self.lora_A_v = nn.Parameter(torch.randn(HE, d_input, r_v) * 0.01)
+        self.lora_B_v = nn.Parameter(torch.zeros(HE, r_v, self.dv))
 
+        # ── Per-expert alpha/beta (KDA memory gating) ──
         d_alpha = int(d_key * 1.618)
         self.alpha_up_w   = nn.Parameter(torch.randn(HE, d_input, d_alpha) * 0.01)
         self.alpha_down_w = nn.Parameter(torch.randn(HE, d_alpha, self.dk_pope) * 0.01)
         self.beta_up_w    = nn.Parameter(torch.randn(HE, d_input, d_alpha) * 0.01)
         self.beta_down_w  = nn.Parameter(torch.randn(HE, d_alpha, 1) * 0.01)
 
-        # ── Batched MHC + norm ──
-        self.batched_mhc = BatchedMHC(HE, d_input, n_mhc)
-        self.batched_norm_w = nn.Parameter(torch.ones(HE, d_input))
+        # ── Per-head MHC + norm (shared across experts in each head) ──
+        self.batched_mhc = BatchedMHC(n_heads, d_input, n_mhc)
+        self.batched_norm_w = nn.Parameter(torch.ones(n_heads, d_input))
 
-        # ── Output path: per-head preGate(KV) → per-expert W_o → per-head postGate(Q) ──
-        self.W_pre_w = nn.Parameter(torch.randn(HE, d_input, self.dv) * 0.01)
+        # ── Per-head preGate/postGate + per-expert W_o ──
+        self.W_pre_w = nn.Parameter(torch.randn(n_heads, d_input, self.dv) * 0.01)
         self.W_o_w   = nn.Parameter(torch.randn(HE, d_input, self.dv) * 0.01)
         d_pg = max(int(d_input * 0.618), 1)
-        self.W_pg1_w = nn.Parameter(torch.randn(HE, d_input, d_pg) * 0.01)
-        self.W_pg2_w = nn.Parameter(torch.randn(HE, d_pg, d_input) * 0.01)
+        self.W_pg1_w = nn.Parameter(torch.randn(n_heads, d_input, d_pg) * 0.01)
+        self.W_pg2_w = nn.Parameter(torch.randn(n_heads, d_pg, d_input) * 0.01)
 
     def _apply_pope(self, x, positions, is_query):
         mu = F.softplus(x)
@@ -278,12 +280,12 @@ class MoAKDALayer(nn.Module):
         fi = active_idx[ki]
         K = ki.shape[0]
 
-        H_res_k, H_pre_k, H_post_k = self.batched_mhc(stream, fi)
+        H_res_k, H_pre_k, H_post_k = self.batched_mhc(stream, hi)
         stream_exp = stream.unsqueeze(0).expand(K, -1, -1, -1, -1)
         h_e = _einsum('kbtn,kbntd->kbtd', H_pre_k, stream_exp)
 
         # Batched RMSNorm
-        nw = self.batched_norm_w[fi]
+        nw = self.batched_norm_w[hi]
         rms = h_e.float().pow(2).mean(-1, keepdim=True).add(1e-8).rsqrt().to(h_e.dtype)
         h_e = h_e * rms * nw.unsqueeze(1).unsqueeze(1)
 
@@ -331,10 +333,10 @@ class MoAKDALayer(nn.Module):
 
         # ── Gates ──
         pre_gate_out = F.silu(_einsum(
-            'kbtd,kde->kbte', h_e, self.W_pre_w[fi]))
-        pg_mid = _einsum('kbtd,kde->kbte', h_e, self.W_pg1_w[fi])
+            'kbtd,kde->kbte', h_e, self.W_pre_w[hi]))
+        pg_mid = _einsum('kbtd,kde->kbte', h_e, self.W_pg1_w[hi])
         pg_out = torch.sigmoid(_einsum(
-            'kbte,ked->kbtd', F.silu(pg_mid), self.W_pg2_w[fi]))
+            'kbte,ked->kbtd', F.silu(pg_mid), self.W_pg2_w[hi]))
 
         # ── Scatter-add to per-head buffers ──
         idx_h = hi.view(-1, 1, 1, 1)
@@ -464,7 +466,7 @@ class MoAKDALayer(nn.Module):
         W = self.W_o_w.reshape(H, E, d, self.dv)           # (H, E, d, dv)
         all_proj = torch.einsum('hbtv,hedv->hbted', gated_he, W)  # (H, B, T, E, d)
         proj_he = all_proj.gather(
-            3, sel.unsqueeze(-1).expand(H, B, T, 1, d)).squeeze(3)
+            3, sel.reshape(H, B, T, 1, 1).expand(H, B, T, 1, d)).squeeze(3)
         result_he = proj_he * acc_post_gate                # (H, B, T, d)
         result = result_he.mean(0)                          # (B, T, d)
 
@@ -518,24 +520,24 @@ class MoESwiGLU(nn.Module):
         # Routing: per-head stacked router
         self.router_w = nn.Parameter(torch.randn(n_heads, n_experts_per_head, d_hidden) * 0.01)
 
-        # MHC + norm
-        self.batched_mhc = BatchedMHC(FE, d_hidden, n_mhc)
-        self.batched_norm_w = nn.Parameter(torch.ones(FE, d_hidden))
+        # MHC + norm (per-head shared)
+        self.batched_mhc = BatchedMHC(n_heads, d_hidden, n_mhc)
+        self.batched_norm_w = nn.Parameter(torch.ones(n_heads, d_hidden))
 
-        # SwiGLU
+        # SwiGLU (per-head shared)
         d_ffn = int(d_hidden * 1.618)
-        self.swiglu_wd_w   = nn.Parameter(torch.randn(FE, self.dh, d_hidden) * 0.01)
-        self.swiglu_wu_w   = nn.Parameter(torch.randn(FE, self.dh, self.dh) * 0.01)
-        self.swiglu_gate_w = nn.Parameter(torch.randn(FE, d_ffn, d_hidden) * 0.01)
-        self.swiglu_up_w   = nn.Parameter(torch.randn(FE, d_ffn, d_hidden) * 0.01)
-        self.swiglu_down_w = nn.Parameter(torch.randn(FE, self.dh, d_ffn) * 0.01)
+        self.swiglu_wd_w   = nn.Parameter(torch.randn(n_heads, self.dh, d_hidden) * 0.01)
+        self.swiglu_wu_w   = nn.Parameter(torch.randn(n_heads, self.dh, self.dh) * 0.01)
+        self.swiglu_gate_w = nn.Parameter(torch.randn(n_heads, d_ffn, d_hidden) * 0.01)
+        self.swiglu_up_w   = nn.Parameter(torch.randn(n_heads, d_ffn, d_hidden) * 0.01)
+        self.swiglu_down_w = nn.Parameter(torch.randn(n_heads, self.dh, d_ffn) * 0.01)
 
-        # Output: per-head preGate(d_hidden→d_head) → per-expert W_o(d_head→d_hidden) → per-head postGate
-        self.W_pre_w = nn.Parameter(torch.randn(FE, d_hidden, self.dh) * 0.01)
+        # Output: per-head preGate/postGate + per-expert W_o
+        self.W_pre_w = nn.Parameter(torch.randn(n_heads, d_hidden, self.dh) * 0.01)
         self.W_o_w   = nn.Parameter(torch.randn(FE, d_hidden, self.dh) * 0.01)
         d_pg = max(int(d_hidden * 0.618), 1)
-        self.W_pg1_w = nn.Parameter(torch.randn(FE, d_hidden, d_pg) * 0.01)
-        self.W_pg2_w = nn.Parameter(torch.randn(FE, d_pg, d_hidden) * 0.01)
+        self.W_pg1_w = nn.Parameter(torch.randn(n_heads, d_hidden, d_pg) * 0.01)
+        self.W_pg2_w = nn.Parameter(torch.randn(n_heads, d_pg, d_hidden) * 0.01)
 
         # Expert embeddings for AttnRes query
         self.w_experts = nn.Parameter(torch.randn(FE, d_hidden) * 0.01)
@@ -558,11 +560,11 @@ class MoESwiGLU(nn.Module):
         ef_ei = active_ef[ki]
         fi = active_idx[ki]
 
-        H_res_k, H_pre_k, H_post_k = self.batched_mhc(stream, fi)
+        H_res_k, H_pre_k, H_post_k = self.batched_mhc(stream, f_hi)
         stream_exp = stream.unsqueeze(0).expand(ki.shape[0], -1, -1, -1, -1)
         h_e = _einsum('kbtn,kbntd->kbtd', H_pre_k, stream_exp)
 
-        nw = self.batched_norm_w[fi]
+        nw = self.batched_norm_w[f_hi]
         rms = h_e.float().pow(2).mean(-1, keepdim=True).add(1e-8).rsqrt().to(h_e.dtype)
         h_e = h_e * rms * nw.unsqueeze(1).unsqueeze(1)
 
@@ -572,21 +574,21 @@ class MoESwiGLU(nn.Module):
         eff = (prob_k + (mask_k.to(prob_k.dtype) - prob_k).detach()).unsqueeze(-1)
 
         # SwiGLU
-        wd_out = _einsum('kbtd,kod->kbto', h_e, self.swiglu_wd_w[fi])
-        g = torch.sigmoid(_einsum('kbtd,kod->kbto', F.silu(wd_out), self.swiglu_wu_w[fi]))
-        gate_out = _einsum('kbtd,kod->kbto', h_e, self.swiglu_gate_w[fi])
-        up_out = _einsum('kbtd,kod->kbto', h_e, self.swiglu_up_w[fi])
-        swiglu_out = g * _einsum('kbtf,kof->kbto', F.silu(gate_out) * up_out, self.swiglu_down_w[fi])
+        wd_out = _einsum('kbtd,kod->kbto', h_e, self.swiglu_wd_w[f_hi])
+        g = torch.sigmoid(_einsum('kbtd,kod->kbto', F.silu(wd_out), self.swiglu_wu_w[f_hi]))
+        gate_out = _einsum('kbtd,kod->kbto', h_e, self.swiglu_gate_w[f_hi])
+        up_out = _einsum('kbtd,kod->kbto', h_e, self.swiglu_up_w[f_hi])
+        swiglu_out = g * _einsum('kbtf,kof->kbto', F.silu(gate_out) * up_out, self.swiglu_down_w[f_hi])
 
         eff_out = eff * swiglu_out
 
         # PreGate
-        pre_gate_out = F.silu(_einsum('kbtd,kde->kbte', h_e, self.W_pre_w[fi]))
+        pre_gate_out = F.silu(_einsum('kbtd,kde->kbte', h_e, self.W_pre_w[f_hi]))
         eff_pg = eff * pre_gate_out
 
         # PostGate
-        pg_mid = _einsum('kbtd,kde->kbte', h_e, self.W_pg1_w[fi])
-        pg_out = torch.sigmoid(_einsum('kbte,ked->kbtd', F.silu(pg_mid), self.W_pg2_w[fi]))
+        pg_mid = _einsum('kbtd,kde->kbte', h_e, self.W_pg1_w[f_hi])
+        pg_out = torch.sigmoid(_einsum('kbte,ked->kbtd', F.silu(pg_mid), self.W_pg2_w[f_hi]))
         eff_post = eff * pg_out
 
         # Scatter-accumulate to per-head buffers
@@ -698,7 +700,7 @@ class MoESwiGLU(nn.Module):
         W = self.W_o_w.reshape(nf, ne, self.d, self.dh)   # (nf, ne, d, dh)
         all_proj = torch.einsum('fbti,feoi->fbteo', gated, W)  # (nf, B, T, ne, d)
         proj = all_proj.gather(
-            3, sel.unsqueeze(-1).expand(nf, B, T, 1, self.d)).squeeze(3)
+            3, sel.reshape(nf, B, T, 1, 1).expand(nf, B, T, 1, self.d)).squeeze(3)
         result_he = proj * acc_post_gate                   # (nf, B, T, d)
         result = result_he.mean(0)                          # (B, T, d)
 
